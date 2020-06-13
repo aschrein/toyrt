@@ -1,9 +1,3 @@
-#define UTILS_TL_IMPL
-#define UTILS_TL_TMP_SIZE 1 << 27
-//#define UTILS_TL_IMPL_DEBUG
-//#define UTILS_AVX512
-#include "utils.hpp"
-
 #include <glm/glm.hpp>
 #include <glm/gtx/quaternion.hpp>
 
@@ -30,6 +24,13 @@ using float4   = vec4;
 using float2x2 = mat2;
 using float3x3 = mat3;
 using float4x4 = mat4;
+
+#define UTILS_TL_IMPL
+#define UTILS_RAND
+#define UTILS_TL_TMP_SIZE 1 << 27
+//#define UTILS_TL_IMPL_DEBUG
+//#define UTILS_AVX512
+#include "utils.hpp"
 
 // https://github.com/graphitemaster/normals_revisited
 static float minor(const float m[16], int r0, int r1, int r2, int c0, int c1,
@@ -550,160 +551,6 @@ struct Ray {
   float3 o;
   float3 d;
 };
-
-#if 0
-				
-struct KDNode {
-  // Bit layout:
-  // +-------------------------+
-  // | 32 31 30 29 28 27 26 25 |
-  // | 24 23 22 21 20 19 18 17 |
-  // | 16 15 14 13 12 11 10 9  |
-  // | 8  7  6  5  4  3  2  1  |
-  // +-------------------------+
-  // +--------------+
-  // | [32:32] Leaf |
-  // +--------------+
-  // |  Leaf:
-  // +->+---------------------+---------------------+
-  // |  | [31:25] Item count  | [24:1] Items offset |
-  // |  +---------------------+---------------------+
-  // |
-  // |  Branch:
-  // +->+-------------+----------------------------+
-  //    | [31:30] dim | [24:1]  First child offset |
-  //    +-------------+----------------------------+
-
-  // constants
-  static constexpr u32 LEAF_BIT  = 1 << 31;
-  static constexpr u32 DIM_BITS  = 0b11; // [00 - x, 01 - y, 10 - z, 11 - undef]
-  static constexpr u32 DIM_SHIFT = 29;
-  // Leaf flags:
-  // 1 + 7 + 24 = 32 bits used
-  static constexpr u32 ITEMS_OFFSET_MASK  = 0xffffff;  // 24 bits
-  static constexpr u32 ITEMS_OFFSET_SHIFT = 0;         // low bits
-  static constexpr u32 NUM_ITEMS_MASK     = 0b1111111; // 7 bits
-  static constexpr u32 NUM_ITEMS_SHIFT    = 24;        // after first 24 bits
-  static constexpr u32 MAX_ITEMS          = 128;       // max items
-  // Node flags:
-  // 1 + 2 + 24 = 28 bits used
-  static constexpr u32 FIRST_CHILD_MASK  = 0xffffff;
-  static constexpr u32 FIRST_CHILD_SHIFT = 0;
-
-  // payload
-  u32 flags;
-  f32 bias;
-
-  // methods
-  float3 get_dir() {
-    u8 dim_bits = ((flags >> DIM_SHIFT) & DIM_BITS);
-    if (dim_bits == 0b00) {
-      return float3(1.0f, 0.0f, 0.0f);
-    }
-    if (dim_bits == 0b01) {
-      return float3(0.0f, 1.0f, 0.0f);
-    }
-    if (dim_bits == 0b10) {
-      return float3(0.0f, 0.0f, 1.0f);
-    }
-    TRAP;
-  }
-  void init_leaf(u32 offset) {
-    flags = LEAF_BIT;
-    ASSERT_DEBUG(offset < ITEMS_OFFSET_MASK);
-    flags |= offset << ITEMS_OFFSET_SHIFT;
-  }
-  void init_branch(KDNode *node, u8 dim, float bias) {
-    ptrdiff_t diff = ((u8 *)node - (u8 *)this) / sizeof(KDNode);
-    ASSERT_DEBUG(diff > 0 && diff < FIRST_CHILD_MASK);
-    flags = (diff << FIRST_CHILD_SHIFT);
-    flags |= ((dim & DIM_BITS) << DIM_SHIFT);
-    this->bias = bias;
-  }
-  bool is_leaf() { return (flags & LEAF_BIT) == LEAF_BIT; }
-  u32  num_items() { return ((flags >> NUM_ITEMS_SHIFT) & NUM_ITEMS_MASK); }
-  u32  items_offset() {
-    return ((flags >> ITEMS_OFFSET_SHIFT) & ITEMS_OFFSET_MASK);
-  }
-  KDNode *first_child() {
-    return this + (((flags >> FIRST_CHILD_SHIFT) & FIRST_CHILD_MASK));
-  }
-  void set_num_items(u32 num) {
-    ASSERT_DEBUG(num <= NUM_ITEMS_MASK);
-    flags &= ~(NUM_ITEMS_MASK << NUM_ITEMS_SHIFT);
-    flags |= (num << NUM_ITEMS_SHIFT);
-  }
-  void add_item() { set_num_items(num_items() + 1); }
-  bool is_full() { return num_items() == NUM_ITEMS_MASK; }
-};
-
-static_assert(sizeof(KDNode) == 8, "Blamey!");
-
-
-struct KDTree {
-  // constants
-  static constexpr u32 MAX_DEPTH         = 16;
-  static constexpr u32 MAX_TRIS_PER_LEAF = 32;
-
-  // data
-  Pool<KDTri>  tri_pool;
-  Pool<KDNode> node_pool;
-
-  KDTri * tris;
-  KDNode *root;
-  // methods
-  u32 alloc_tri_chunk() {
-    KDTri *tri_root  = tri_pool.at(0);
-    KDTri *new_chunk = tri_pool.alloc(KDNode::MAX_ITEMS);
-    return (u32)(((u8 *)new_chunk - (u8 *)tri_root) / sizeof(KDTri));
-  }
-  void split(KDNode *node, float3 node_dir, float node_bias, float3 node_min,
-             float3 node_max, u32 depth) {
-    ASSERT_DEBUG(depth < MAX_DEPTH);
-    u32    items_offset = node->items_offset();
-    KDTri *tris         = tri_pool.at(items_offset);
-    u32    num_items    = node->num_items();
-    TMP_STORAGE_SCOPE;
-    KDTri *tmp_items = (KDTri *)tl_alloc_tmp(sizeof(KDTri) * num_items);
-    memcpy(tmp_items, tris, sizeof(KDTri) * num_items);
-    KDNode *children = node_pool.alloc(2);
-    children[0].init_leaf(items_offset);
-    children[1].init_leaf(alloc_tri_chunk());
-    // dimensions
-    kto(3) {
-      // start points/end points
-      float sp[KDNode::MAX_ITEMS];
-      float ep[KDNode::MAX_ITEMS];
-      ito(node->num_items()) { KDTri tri = tris[i]; }
-    }
-    // node->init_branch(children, );
-    // Push items from the parent to its children
-    // float child_size = node_size / 2.0f;
-    /* ito(4) {
-       Vec2 ch_pos = get_child_pos(node_pos, node_size, i);
-       jto(num_items) {
-         QuadItem item = tmp_items[j];
-         if (intersects({item.pos_x, item.pos_y}, item.size, ch_pos,
-                        child_size)) {
-           push_item(children + i, ch_pos, child_size, {item.pos_x, item.pos_y},
-                     item.size, item.id, depth + 1);
-         }
-       }
-     }*/
-  }
-  void init() { //
-    tri_pool  = Pool<KDTri>::create(1 << 20);
-    node_pool = Pool<KDNode>::create(1 << 16);
-    root      = node_pool.alloc(1);
-    root->init_leaf(alloc_tri_chunk());
-  }
-  void push_tri(float3 a, float3 b, float3 c //
-  ) {                                        //
-  }
-  void trace(Ray const &ray, Collision &col) { //
-  }
-};
-#endif // 0
 
 struct Tri {
   u32    id;
@@ -1330,84 +1177,148 @@ Ray gen_ray(Camera cam, float2 uv) {
     r.d = normalize(cam.look + cam.fov * (cam.right * uv.x + cam.up * uv.y));
     return r;
 }
+
+struct Scene {
+    PBR_Model model;
+    Random_Factory rf;
+    Array<BVH> bvhs;
+     Pool<Tri> tri_pool;
+
+    void init(string_ref filename) {
+     model = load_gltf_pbr(filename);  
+      bvhs.init();
+
+      tri_pool = Pool<Tri>::create(1 << 20);
+      kto (model.meshes.size) {
+         Raw_Mesh_Opaque &mesh = model.meshes[k];
+         tri_pool.reset();
+         Tri *tris = tri_pool.alloc(mesh.num_indices / 3);
+         u32 num_tris = mesh.num_indices / 3;
+         ito (num_tris) {
+            Triangle_Full ftri = mesh.fetch_triangle(i);
+            tris[i].a = ftri.v0.position;
+            tris[i].b = ftri.v1.position;
+            tris[i].c = ftri.v2.position;
+            tris[i].id = i;
+         }
+         BVH bvh;
+         bvh.init(tris, num_tris);
+         bvhs.push(bvh);
+        }
+
+    }
+
+    float3 trace(float3 ro, float3 rd, Collision &col, u32 depth = 0) {
+      if (depth == 3)
+          return float3(0.0f, 0.0f, 0.0f);
+      bool hit = false;
+      col.t = 1.0e10f;
+      kto(model.meshes.size) {
+                BVH &bvh = bvhs[k];
+                bvh.traverse(ro, rd, [&](Tri &tri) {
+                    Collision c;
+                    if (ray_triangle_test_moller(ro, rd, tri.a, tri.b, tri.c, c)) {
+                      if (c.t < col.t) {
+                        hit = true;
+                        col = c;
+                        col.mesh_id = k;
+                        col.face_id = tri.id;
+                      }
+                    }
+                });
+
+            }
+      if (!hit) {
+        return float3(1.0f, 1.0f, 1.0f) * std::abs(rd.y);    
+      } else {
+          const u32 N = 128 >> depth;
+          float3 res= float3(0.0f, 0.0f, 0.0f);
+          ito (N) {
+          float3 rn = rf.sample_lambert_BRDF(col.normal);
+          Collision new_col;
+          res += trace(col.position + 1.0e-4f * col.normal, rn, new_col, depth + 1);    
+        }
+          return res / float(N);
+      }
+  }
+
+    void release() {
+          ito(bvhs.size) bvhs[i].release();    
+      bvhs.release();
+
+      tri_pool.release();
+      model.release();
+    }
+};
+
+uint32_t rgba32f_to_rgba8_unorm(float r, float g, float b, float a) {
+  uint8_t r8 = (uint8_t)(clamp(r, 0.0f, 1.0f) * 255.0f);
+  uint8_t g8 = (uint8_t)(clamp(g, 0.0f, 1.0f) * 255.0f);
+  uint8_t b8 = (uint8_t)(clamp(b, 0.0f, 1.0f) * 255.0f);
+  uint8_t a8 = (uint8_t)(clamp(a, 0.0f, 1.0f) * 255.0f);
+  return                     //
+      ((uint32_t)r8 << 0) |  //
+      ((uint32_t)g8 << 8) |  //
+      ((uint32_t)b8 << 16) | //
+      ((uint32_t)a8 << 24);  //
+}
+
+uint32_t rgba32f_to_srgba8_unorm(float r, float g, float b, float a) {
+  uint8_t r8 = (uint8_t)(clamp(std::pow(r, 1.0f / 2.2f), 0.0f, 1.0f) * 255.0f);
+  uint8_t g8 = (uint8_t)(clamp(std::pow(g, 1.0f / 2.2f), 0.0f, 1.0f) * 255.0f);
+  uint8_t b8 = (uint8_t)(clamp(std::pow(b, 1.0f / 2.2f), 0.0f, 1.0f) * 255.0f);
+  uint8_t a8 = (uint8_t)(clamp(std::pow(a, 1.0f / 2.2f), 0.0f, 1.0f) * 255.0f);
+  return                     //
+      ((uint32_t)r8 << 0) |  //
+      ((uint32_t)g8 << 8) |  //
+      ((uint32_t)b8 << 16) | //
+      ((uint32_t)a8 << 24);  //
+}
+
 int main(int argc, char *argv[]) {
   (void)argc;
   (void)argv;
   //vec_test();
   //sort_test();
-  PBR_Model model = load_gltf_pbr(stref_s("models/human_bust_sculpt/scene.gltf"));
-  //PBR_Model model = load_gltf_pbr(stref_s("models/tree_low-poly_3d_model/scene.gltf"));
+  Scene scene;
+  //scene.init(stref_s("models/human_bust_sculpt/scene.gltf"));
+  scene.init(stref_s("models/tree_low-poly_3d_model/scene.gltf"));
+  defer(scene.release());
   int2 iResolution = int2(512, 512);
   float2 m = float2(0.0f, 0.0f);
   const float PI = 3.141592654f;
   Camera cam = gen_camera(
-        0.0f,
-        PI / 2.0f,
-        30.0,
+        PI * 0.3f,
+        PI * 0.5,
+        45.0,
         float3(0.0, 0.0, 0.0),
-        1.4
+        1.0
       );
-  Array<BVH> bvhs;
-  bvhs.init();
-  defer({
-      ito(bvhs.size) bvhs[i].release();    
-      bvhs.release();
-    });
-  Pool<Tri> tri_pool = Pool<Tri>::create(1 << 20);
-  defer(tri_pool.release());
-  kto (model.meshes.size) {
-     Raw_Mesh_Opaque &mesh = model.meshes[k];
-     tri_pool.reset();
-     Tri *tris = tri_pool.alloc(mesh.num_indices / 3);
-     u32 num_tris = mesh.num_indices / 3;
-     ito (num_tris) {
-        Triangle_Full ftri = mesh.fetch_triangle(i);
-        tris[i].a = ftri.v0.position;
-        tris[i].b = ftri.v1.position;
-        tris[i].c = ftri.v2.position;
-        tris[i].id = i;
-     }
-     BVH bvh;
-     bvh.init(tris, num_tris);
-     bvhs.push(bvh);
-    }
+      
   {
       u64 bvh_hits = 0;
       u64 tri_hits = 0;
       TMP_STORAGE_SCOPE;
       u8 *rgb_image = (u8*)tl_alloc_tmp(iResolution.x * iResolution.y * 3);
-      ito(iResolution.y) {
+      #pragma omp parallel
+      #pragma omp for
+      for (i32 i = 0; i < (i32)iResolution.y; i++ ) {
         jto(iResolution.x) {
             float2 uv = float2((float(j) + 0.5f) / iResolution.y, (float(iResolution.y - i - 1) + 0.5f) / iResolution.y) * 2.0f - 1.0f;
             Ray ray = gen_ray(cam, uv);
             u8 intersects = 0;
-            kto(model.meshes.size) {
-                BVH &bvh = bvhs[k];
-                bvh.traverse(ray.o, ray.d, [&](Tri &tri) {
-                    bvh_hits++;
-                    Collision c;
-                    if (ray_triangle_test_moller(ray.o, ray.d, tri.a, tri.b, tri.c, c)) {
-                        intersects++;    
-                        tri_hits++;
-                    }
-                });
-
-            }
-            if (intersects) {
-                rgb_image[i * iResolution.x * 3 + j * 3 + 0] = intersects * 100;
-                rgb_image[i * iResolution.x * 3 + j * 3 + 1] = intersects;
-                rgb_image[i * iResolution.x * 3 + j * 3 + 2] = 0u;
-            } else {
-                rgb_image[i * iResolution.x * 3 + j * 3 + 0] = 0u;
-                rgb_image[i * iResolution.x * 3 + j * 3 + 1] = 0u;
-                rgb_image[i * iResolution.x * 3 + j * 3 + 2] = 0u;
-            }
+            Collision col;
+            float3 d = scene.trace(ray.o, ray.d, col);
+                u32 rgba8 = rgba32f_to_rgba8_unorm(d.r, d.g, d.b, 1.0f);
+                rgb_image[i * iResolution.x * 3 + j * 3 + 0] = (rgba8 >> 0)  & 0xffu;
+                rgb_image[i * iResolution.x * 3 + j * 3 + 1] = (rgba8 >> 8)  & 0xffu;
+                rgb_image[i * iResolution.x * 3 + j * 3 + 2] = (rgba8 >> 16) & 0xffu;
+           
         }
       }
-      fprintf(stdout, "%lu %lu\n", bvh_hits, tri_hits);
+      /*fprintf(stdout, "%lu %lu\n", bvh_hits, tri_hits);*/
       write_image_2d_i24_ppm("image.ppm", rgb_image, iResolution.x * 3, iResolution.x, iResolution.y);
   }
-  model.release();
   #ifdef UTILS_TL_IMPL_DEBUG
   assert_tl_alloc_zero();
   #endif

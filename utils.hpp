@@ -1266,6 +1266,117 @@ SOP(-)
 
 //#endif // UTILS_AVX512
 
+static constexpr float PI                  = 3.1415926;
+static constexpr float TWO_PI              = 6.2831852;
+static constexpr float FOUR_PI             = 12.566370;
+static constexpr float INV_PI              = 0.3183099;
+static constexpr float INV_TWO_PI          = 0.1591549;
+static constexpr float INV_FOUR_PI         = 0.0795775;
+static constexpr float DIELECTRIC_SPECULAR = 0.04;
+
+static inline float halton(int i, int base) {
+  float x = 1.0f / base, v = 0.0f;
+  while (i > 0) {
+    v += x * (i % base);
+    i = floor(i / base);
+    x /= base;
+  }
+  return v;
+}
+
+struct PCG {
+  u64 state = 0x853c49e6748fea9bULL;
+  u64 inc   = 0xda3e39cb94b95bdbULL;
+  u32 next() {
+    uint64_t oldstate   = state;
+    state               = oldstate * 6364136223846793005ULL + inc;
+    uint32_t xorshifted = uint32_t(((oldstate >> 18u) ^ oldstate) >> 27u);
+    int      rot        = oldstate >> 59u;
+    return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
+  }
+  f64 nextf() { return double(next()) / UINT32_MAX; }
+};
+
+#ifdef UTILS_RAND
+
+class Random_Factory {
+  public:
+  float  rand_unit_float() { return float(pcg.nextf()); }
+  float3 rand_unit_cube() {
+    return float3{rand_unit_float() * 2.0 - 1.0, rand_unit_float() * 2.0 - 1.0,
+                  rand_unit_float() * 2.0 - 1.0};
+  }
+  // Random unsigned integer in the range [begin, end)
+  u32 uniform(u32 begin, u32 end) {
+    ASSERT_PANIC(end > begin);
+    u32 range = end - begin;
+    u32 mod   = UINT32_MAX % range;
+    if (mod == 0) return (pcg.next() % range) + begin;
+    // Kill the bias
+    u32 new_max = UINT32_MAX - mod;
+    while (true) {
+      u32 rand = pcg.next();
+      if (rand > new_max) continue;
+      return (rand % range) + begin;
+    }
+  }
+  // Z is up here
+  float3 polar_to_cartesian(float sinTheta, float cosTheta, float sinPhi,
+                            float cosPhi) {
+    return float3(sinTheta * cosPhi, sinTheta * sinPhi, cosTheta);
+  }
+  // Z is up here
+  float3 uniform_sample_cone(float cos_theta_max, float3 xbasis, float3 ybasis,
+                             float3 zbasis) {
+    vec2   rand     = vec2(rand_unit_float(), rand_unit_float());
+    float  cosTheta = (1.0f - rand.x) + rand.x * cos_theta_max;
+    float  sinTheta = std::sqrt(1.0f - cosTheta * cosTheta);
+    float  phi      = rand.y * PI * 2.0f;
+    float3 samplev = polar_to_cartesian(sinTheta, cosTheta, sin(phi), cos(phi));
+    return samplev.x * xbasis + samplev.y * ybasis + samplev.z * zbasis;
+  }
+
+  float3 rand_unit_sphere() {
+    while (true) {
+      float3 pos = rand_unit_cube();
+      if (dot(pos, pos) <= 1.0f) return pos;
+    }
+  }
+
+  float3 rand_unit_sphere_surface() {
+    while (true) {
+      float3 pos = rand_unit_cube();
+      f32    len2 = dot(pos, pos);
+      if (len2 <= 1.0f) return pos / std::sqrt(len2);
+    }
+  }
+
+  float3 sample_lambert_BRDF(float3 N) {
+    return normalize(N + rand_unit_sphere());
+  }
+
+  vec2 random_halton() {
+    f32 u = halton(halton_id + 1, 2);
+    f32 v = halton(halton_id + 1, 3);
+    halton_id++;
+    return vec2(u, v);
+  }
+
+  static float3 SampleHemisphere_Cosinus(float2 xi) {
+    float phi      = xi.y * 2.0 * PI;
+    float cosTheta = std::sqrt(1.0 - xi.x);
+    float sinTheta = std::sqrt(1.0 - cosTheta * cosTheta);
+
+    return vec3(std::cos(phi) * sinTheta, std::sin(phi) * sinTheta, cosTheta);
+  }
+
+  private:
+  PCG pcg;
+  u32 halton_id = 0;
+};
+
+#endif // UTILS_RAND
+
 #endif
 
 #ifdef UTILS_TL_IMPL
