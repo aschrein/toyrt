@@ -106,7 +106,7 @@ protected:
     void Execute( aiScene* pScene);
 
 private:
-
+    void FixTangents(aiMesh *pMesh, unsigned int meshIndex);
     /** Configuration option: maximum smoothing angle, in radians*/
     float configMaxAngle;
     unsigned int configSourceUV;

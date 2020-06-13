@@ -95,7 +95,9 @@ static void restore_fpe(u32 new_mask) {
 #undef MIN
 #undef MAX
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
+#define MIN3(x, y, z) MIN(x, MIN(y, z))
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
+#define MAX3(x, y, z) MAX(x, MAX(y, z))
 #define CLAMP(x, a, b) ((x) < (a) ? (a) : ((x) > (b) ? (b) : (x)))
 #define OFFSETOF(class, field) ((size_t) & (((class *)0)->field))
 #define MEMZERO(x) memset(&x, 0, sizeof(x))
@@ -529,13 +531,10 @@ static inline char const *stref_to_tmp_cstr(string_ref a) {
 static inline int32_t stref_find(string_ref a, string_ref b, size_t start = 0) {
   size_t cursor = 0;
   for (size_t i = start; i < a.len; i++) {
-    if (a.ptr[i] == b.ptr[cursor]) {
-      cursor += 1;
-    } else {
-      i -= cursor;
-      cursor = 0;
+    for (size_t j = 0; j < b.len && i + j < a.len; j++) {
+      if (a.ptr[i + j] != b.ptr[j]) break;
+      if (j == b.len - 1) return (i32)(i - j);
     }
-    if (cursor == b.len) return (int32_t)(i - (cursor - 1));
   }
   return -1;
 }
@@ -550,6 +549,20 @@ static inline int32_t stref_find_last(string_ref a, string_ref b,
       cursor = stref_find_last(a, b, (size_t)(cursor + 1));
   }
   return last_pos;
+}
+
+static inline int32_t stref_find_last(string_ref a, char b) {
+  int32_t last_pos = -1;
+  ito(a.len) {
+    if (a.ptr[i] == b) last_pos = (i32)i;
+  }
+  return last_pos;
+}
+
+static inline string_ref get_dir(string_ref path) {
+  if (path.ptr[path.len - 1] == '/') path.len -= 1;
+  int32_t sep = stref_find_last(path, '/');
+  return path.substr(0, sep);
 }
 
 #if __linux__
@@ -791,6 +804,13 @@ struct Array {
   void memzero() {
     if (capacity > 0) {
       memset(ptr, 0, sizeof(T) * capacity);
+    }
+  }
+  void reserve(size_t new_capacity) {
+    if (new_capacity > capacity) {
+      ptr      = (T *)Allcator_t::realloc(ptr, sizeof(T) * capacity,
+                                     sizeof(T) * new_capacity);
+      capacity = new_capacity;
     }
   }
   void push(T elem) {
@@ -1248,15 +1268,22 @@ SOP(-)
 
 #endif
 
-#ifdef UTILS_IMPL
-#ifndef UTILS_IMPL_H
-#define UTILS_IMPL_H
+#ifdef UTILS_TL_IMPL
+#ifndef UTILS_TL_IMPL_H
+#define UTILS_TL_IMPL_H
 #include <string.h>
+
+#ifndef UTILS_TL_TMP_SIZE
+#define UTILS_TL_TMP_SIZE 1 << 24
+#endif
 
 struct Thread_Local {
   Temporary_Storage<> temporal_storage;
   bool                initialized = false;
   ~Thread_Local() { temporal_storage.release(); }
+#ifdef UTILS_TL_IMPL_DEBUG
+  i64 allocated = 0;
+#endif
 };
 
 // TODO(aschrein): Change to __thread?
@@ -1265,7 +1292,7 @@ thread_local Thread_Local g_tl{};
 Thread_Local *get_tl() {
   if (g_tl.initialized == false) {
     g_tl.initialized      = true;
-    g_tl.temporal_storage = Temporary_Storage<>::create(1 << 24);
+    g_tl.temporal_storage = Temporary_Storage<>::create(UTILS_TL_TMP_SIZE);
   }
   return &g_tl;
 }
@@ -1277,9 +1304,17 @@ void *tl_alloc_tmp(size_t size) {
 void tl_alloc_tmp_enter() { get_tl()->temporal_storage.enter_scope(); }
 void tl_alloc_tmp_exit() { get_tl()->temporal_storage.exit_scope(); }
 
-void *tl_alloc(size_t size) { return malloc(size); }
+void *tl_alloc(size_t size) {
+#ifdef UTILS_TL_IMPL_DEBUG
+  get_tl()->allocated += (i64)size;
+  void *ptr          = malloc(size + sizeof(size_t));
+  ((size_t *)ptr)[0] = size;
+  return ((u8 *)ptr + 8);
+#endif
+  return malloc(size);
+}
 
-void *tl_realloc(void *ptr, size_t oldsize, size_t newsize) {
+static inline void *_tl_realloc(void *ptr, size_t oldsize, size_t newsize) {
   if (oldsize == newsize) return ptr;
   size_t min_size = oldsize < newsize ? oldsize : newsize;
   void * new_ptr  = NULL;
@@ -1291,6 +1326,40 @@ void *tl_realloc(void *ptr, size_t oldsize, size_t newsize) {
   return new_ptr;
 }
 
-void tl_free(void *ptr) { free(ptr); }
+#ifdef UTILS_TL_IMPL_DEBUG
+static inline void assert_tl_alloc_zero() {
+  ASSERT_ALWAYS(get_tl()->allocated == 0);
+  ASSERT_ALWAYS(get_tl()->temporal_storage.cursor == 0);
+  ASSERT_ALWAYS(get_tl()->temporal_storage.stack_cursor == 0);
+}
 #endif
+
+void *tl_realloc(void *ptr, size_t oldsize, size_t newsize) {
+#ifdef UTILS_TL_IMPL_DEBUG
+  if (ptr == NULL) {
+    ASSERT_ALWAYS(oldsize == 0);
+    return tl_alloc(newsize);
+  }
+  get_tl()->allocated -= (i64)oldsize;
+  get_tl()->allocated += (i64)newsize;
+  void *old_ptr = (u8 *)ptr - sizeof(size_t);
+  ASSERT_ALWAYS(((size_t *)old_ptr)[0] == oldsize);
+  void *new_ptr =
+      _tl_realloc(old_ptr, oldsize + sizeof(size_t), newsize + sizeof(size_t));
+  ((size_t *)new_ptr)[0] = newsize;
+  return ((u8 *)new_ptr + sizeof(size_t));
 #endif
+  return _tl_realloc(ptr, oldsize, newsize);
+}
+
+void tl_free(void *ptr) {
+#ifdef UTILS_TL_IMPL_DEBUG
+  size_t size = ((size_t *)((u8 *)ptr - sizeof(size_t)))[0];
+  get_tl()->allocated -= (i64)size;
+  free(((u8 *)ptr - sizeof(size_t)));
+  return;
+#endif
+  free(ptr);
+}
+#endif // UTILS_TL_IMPL_H
+#endif // UTILS_TL_IMPL
