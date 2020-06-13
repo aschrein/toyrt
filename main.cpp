@@ -1,454 +1,18 @@
-#include <glm/glm.hpp>
-#include <glm/gtx/quaternion.hpp>
-
-#define STB_IMAGE_IMPLEMENTATION
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-
-#include "assimp/Importer.hpp"
-#include "assimp/postprocess.h"
-#include "assimp/scene.h"
-#include <assimp/contrib/stb_image/stb_image.h>
-#include <assimp/pbrmaterial.h>
-
-using namespace glm;
-
-using int2     = ivec2;
-using int3     = ivec3;
-using int4     = ivec4;
-using uint2    = uvec2;
-using uint3    = uvec3;
-using uint4    = uvec4;
-using float2   = vec2;
-using float3   = vec3;
-using float4   = vec4;
-using float2x2 = mat2;
-using float3x3 = mat3;
-using float4x4 = mat4;
+#include "rt.hpp"
 
 #define UTILS_TL_IMPL
-#define UTILS_RAND
 #define UTILS_TL_TMP_SIZE 1 << 27
-//#define UTILS_TL_IMPL_DEBUG
-//#define UTILS_AVX512
 #include "utils.hpp"
 
-// https://github.com/graphitemaster/normals_revisited
-static float minor(const float m[16], int r0, int r1, int r2, int c0, int c1,
-                   int c2) {
-  return m[4 * r0 + c0] * (m[4 * r1 + c1] * m[4 * r2 + c2] -
-                           m[4 * r2 + c1] * m[4 * r1 + c2]) -
-         m[4 * r0 + c1] * (m[4 * r1 + c0] * m[4 * r2 + c2] -
-                           m[4 * r2 + c0] * m[4 * r1 + c2]) +
-         m[4 * r0 + c2] * (m[4 * r1 + c0] * m[4 * r2 + c1] -
-                           m[4 * r2 + c0] * m[4 * r1 + c1]);
-}
+#include <marl/scheduler.h>
+#include <marl/thread.h>
+#include <marl/waitgroup.h>
 
-static void cofactor(const float src[16], float dst[16]) {
-  dst[0]  = minor(src, 1, 2, 3, 1, 2, 3);
-  dst[1]  = -minor(src, 1, 2, 3, 0, 2, 3);
-  dst[2]  = minor(src, 1, 2, 3, 0, 1, 3);
-  dst[3]  = -minor(src, 1, 2, 3, 0, 1, 2);
-  dst[4]  = -minor(src, 0, 2, 3, 1, 2, 3);
-  dst[5]  = minor(src, 0, 2, 3, 0, 2, 3);
-  dst[6]  = -minor(src, 0, 2, 3, 0, 1, 3);
-  dst[7]  = minor(src, 0, 2, 3, 0, 1, 2);
-  dst[8]  = minor(src, 0, 1, 3, 1, 2, 3);
-  dst[9]  = -minor(src, 0, 1, 3, 0, 2, 3);
-  dst[10] = minor(src, 0, 1, 3, 0, 1, 3);
-  dst[11] = -minor(src, 0, 1, 3, 0, 1, 2);
-  dst[12] = -minor(src, 0, 1, 2, 1, 2, 3);
-  dst[13] = minor(src, 0, 1, 2, 0, 2, 3);
-  dst[14] = -minor(src, 0, 1, 2, 0, 1, 3);
-  dst[15] = minor(src, 0, 1, 2, 0, 1, 2);
-}
-
-static float4x4 cofactor(float4x4 const &in) {
-  float4x4 out;
-  cofactor(&in[0][0], &out[0][0]);
-  return out;
-}
+#define TRACY_ENABLE 1
+#define TRACY_NO_EXIT 1
+#include <tracy/Tracy.hpp>
 
 #define PACK_SIZE 16
-
-enum class Format_t {
-  RGBA8_UNORM = 0,
-  RGBA8_SRGB,
-  RGB8_UNORM,
-  RG32_FLOAT,
-  RGB32_FLOAT,
-  RGBA32_FLOAT,
-};
-
-struct Image2D_Raw {
-  u32      width;
-  u32      height;
-  Format_t format;
-  u8 *     data;
-  void     init(u32 width, u32 height, Format_t format, u8 *data) {
-    MEMZERO(*this);
-    this->width  = width;
-    this->height = height;
-    this->format = format;
-    u32 size     = get_bpp() * width * height;
-    this->data   = (u8 *)tl_alloc(size);
-    memcpy(this->data, data, size);
-  }
-  void release() {
-    if (data != NULL) tl_free(data);
-    MEMZERO(*this);
-  }
-  u32 get_bpp() {
-    switch (format) {
-    case Format_t::RGBA8_UNORM:
-    case Format_t::RGBA8_SRGB: return 4u;
-    case Format_t::RGB32_FLOAT: return 12u;
-    default: ASSERT_PANIC(false && "unsupported format");
-    }
-  }
-  vec4 load(uint2 coord) {
-    u32 bpc = 4u;
-    switch (format) {
-    case Format_t::RGBA8_UNORM:
-    case Format_t::RGBA8_SRGB: bpc = 4u; break;
-    case Format_t::RGB32_FLOAT: bpc = 12u; break;
-    default: ASSERT_PANIC(false && "unsupported format");
-    }
-    auto load_f32 = [&](uint2 coord, u32 component) {
-      uint2 size = uint2(width, height);
-      return *(
-          f32 *)&data[coord.x * bpc + coord.y * size.x * bpc + component * 4u];
-    };
-    uint2 size = uint2(width, height);
-    if (coord.x >= size.x) coord.x = size.x - 1;
-    if (coord.y >= size.y) coord.y = size.y - 1;
-    switch (format) {
-    case Format_t::RGBA8_UNORM: {
-      u8 r = data[coord.x * bpc + coord.y * size.x * bpc];
-      u8 g = data[coord.x * bpc + coord.y * size.x * bpc + 1u];
-      u8 b = data[coord.x * bpc + coord.y * size.x * bpc + 2u];
-      u8 a = data[coord.x * bpc + coord.y * size.x * bpc + 3u];
-      return vec4(float(r) / 255.0f, float(g) / 255.0f, float(b) / 255.0f,
-                  float(a) / 255.0f);
-    }
-    case Format_t::RGBA8_SRGB: {
-      u8 r = data[coord.x * bpc + coord.y * size.x * bpc];
-      u8 g = data[coord.x * bpc + coord.y * size.x * bpc + 1u];
-      u8 b = data[coord.x * bpc + coord.y * size.x * bpc + 2u];
-      u8 a = data[coord.x * bpc + coord.y * size.x * bpc + 3u];
-
-      auto out = vec4(float(r) / 255.0f, float(g) / 255.0f, float(b) / 255.0f,
-                      float(a) / 255.0f);
-      out.r    = std::pow(out.r, 2.2f);
-      out.g    = std::pow(out.g, 2.2f);
-      out.b    = std::pow(out.b, 2.2f);
-      out.a    = std::pow(out.a, 2.2f);
-      return out;
-    }
-    case Format_t::RGB32_FLOAT: {
-      f32 r = load_f32(coord, 0u);
-      f32 g = load_f32(coord, 1u);
-      f32 b = load_f32(coord, 2u);
-      return vec4(r, g, b, 1.0f);
-    }
-    default: ASSERT_PANIC(false && "unsupported format");
-    }
-  };
-  vec4 sample(vec2 uv) {
-    ivec2 size    = ivec2(width, height);
-    vec2  suv     = uv * vec2(float(size.x - 1u), float(size.y - 1u));
-    ivec2 coord[] = {
-        ivec2(i32(suv.x), i32(suv.y)),
-        ivec2(i32(suv.x), i32(suv.y + 1.0f)),
-        ivec2(i32(suv.x + 1.0f), i32(suv.y)),
-        ivec2(i32(suv.x + 1.0f), i32(suv.y + 1.0f)),
-    };
-    ito(4) {
-      // Repeat
-      jto(2) {
-        while (coord[i][j] >= size[j]) coord[i][j] -= size[j];
-        while (coord[i][j] < 0) coord[i][j] += size[j];
-      }
-    }
-    vec2  fract = vec2(suv.x - std::floor(suv.x), suv.y - std::floor(suv.y));
-    float weights[] = {
-        (1.0f - fract.x) * (1.0f - fract.y),
-        (1.0f - fract.x) * (fract.y),
-        (fract.x) * (1.0f - fract.y),
-        (fract.x) * (fract.y),
-    };
-    vec4 result = vec4(0.0f, 0.0f, 0.0f, 0.0f);
-    ito(4) result += load(uint2(coord[i].x, coord[i].y)) * weights[i];
-    return result;
-  };
-};
-
-enum class Index_t { U32, U16 };
-
-enum class Attribute_t {
-  NONE = 0,
-  POSITION,
-  NORMAL,
-  BINORMAL,
-  TANGENT,
-  UV0,
-  UV1,
-  UV2,
-  UV3
-};
-
-static inline float3 safe_normalize(float3 v) {
-  return v / (glm::length(v) + 1.0e-5f);
-}
-
-struct Vertex_Full {
-  float3      position;
-  float3      normal;
-  float3      binormal;
-  float3      tangent;
-  float2      u0;
-  float2      u1;
-  float2      u2;
-  float2      u3;
-  Vertex_Full transform(float4x4 const &transform) {
-    Vertex_Full out;
-    float4x4    cmat = cofactor(transform);
-    out.position     = float3(transform * float4(position, 1.0f));
-    out.normal       = safe_normalize(float3(cmat * float4(normal, 0.0f)));
-    out.tangent      = safe_normalize(float3(cmat * float4(tangent, 0.0f)));
-    out.binormal     = safe_normalize(float3(cmat * float4(binormal, 0.0f)));
-    out.u0           = u0;
-    out.u1           = u1;
-    out.u2           = u2;
-    out.u3           = u3;
-    return out;
-  }
-};
-struct Tri_Index {
-  u32 i0, i1, i2;
-};
-struct Triangle_Full {
-  Vertex_Full v0;
-  Vertex_Full v1;
-  Vertex_Full v2;
-};
-// We are gonna use one simplified material schema for everything
-struct PBR_Material {
-  // R8G8B8A8
-  i32 normal_id = -1;
-  // R8G8B8A8
-  i32 albedo_id = -1;
-  // R8G8B8A8
-  // AO+Roughness+Metalness
-  i32    arm_id           = -1;
-  f32    metal_factor     = 1.0f;
-  f32    roughness_factor = 1.0f;
-  float4 albedo_factor    = float4(1.0f);
-};
-
-struct Raw_Mesh_Opaque {
-  struct Attribute {
-    Attribute_t type;
-    Format_t    format;
-    u32         offset;
-  };
-  Array<u8>                  attribute_data;
-  Array<u8>                  index_data;
-  Index_t                    index_type;
-  InlineArray<Attribute, 16> attributes;
-  u32                        vertex_stride;
-  u32                        num_vertices;
-  u32                        num_indices;
-
-  void init() {
-    attributes.init();
-    attribute_data.init();
-    index_data.init();
-    vertex_stride = 0;
-  }
-  void release() {
-    attributes.release();
-    attribute_data.release();
-    index_data.release();
-    vertex_stride = 0;
-  }
-
-  float3 fetch_position(u32 index) {
-    ito(attributes.size) {
-      switch (attributes[i].type) {
-
-      case Attribute_t::POSITION:
-        ASSERT_PANIC(attributes[i].format == Format_t::RGB32_FLOAT);
-        float3 pos;
-        memcpy(&pos,
-               attribute_data.at(index * vertex_stride + attributes[i].offset),
-               12);
-        return pos;
-      default: break;
-      }
-    }
-    TRAP;
-  }
-  Vertex_Full fetch_vertex(u32 index) {
-    Vertex_Full v;
-    MEMZERO(v);
-    ito(attributes.size) {
-      switch (attributes[i].type) {
-      case Attribute_t::NORMAL:
-        ASSERT_PANIC(attributes[i].format == Format_t::RGB32_FLOAT);
-        memcpy(&v.normal,
-               attribute_data.at(index * vertex_stride + attributes[i].offset),
-               12);
-        break;
-      case Attribute_t::BINORMAL:
-        ASSERT_PANIC(attributes[i].format == Format_t::RGB32_FLOAT);
-        memcpy(&v.binormal,
-               attribute_data.at(index * vertex_stride + attributes[i].offset),
-               12);
-        break;
-      case Attribute_t::TANGENT:
-        ASSERT_PANIC(attributes[i].format == Format_t::RGB32_FLOAT);
-        memcpy(&v.tangent,
-               attribute_data.at(index * vertex_stride + attributes[i].offset),
-               12);
-        break;
-      case Attribute_t::POSITION:
-        ASSERT_PANIC(attributes[i].format == Format_t::RGB32_FLOAT);
-        memcpy(&v.position,
-               attribute_data.at(index * vertex_stride + attributes[i].offset),
-               12);
-        break;
-      case Attribute_t::UV0:
-        ASSERT_PANIC(attributes[i].format == Format_t::RG32_FLOAT);
-        memcpy(&v.u0,
-               attribute_data.at(index * vertex_stride + attributes[i].offset),
-               8);
-        break;
-      case Attribute_t::UV1:
-        ASSERT_PANIC(attributes[i].format == Format_t::RG32_FLOAT);
-        memcpy(&v.u1,
-               attribute_data.at(index * vertex_stride + attributes[i].offset),
-               8);
-        break;
-      case Attribute_t::UV2:
-        ASSERT_PANIC(attributes[i].format == Format_t::RG32_FLOAT);
-        memcpy(&v.u2,
-               attribute_data.at(index * vertex_stride + attributes[i].offset),
-               8);
-        break;
-      case Attribute_t::UV3:
-        ASSERT_PANIC(attributes[i].format == Format_t::RG32_FLOAT);
-        memcpy(&v.u3,
-               attribute_data.at(index * vertex_stride + attributes[i].offset),
-               8);
-        break;
-      default: TRAP;
-      }
-    }
-    return v;
-  }
-
-  Tri_Index get_tri_index(u32 id) {
-    Tri_Index o;
-    if (index_type == Index_t::U16) {
-      o.i0 = (u32) * (u16 *)index_data.at(2 * (id * 3 + 0));
-      o.i1 = (u32) * (u16 *)index_data.at(2 * (id * 3 + 1));
-      o.i2 = (u32) * (u16 *)index_data.at(2 * (id * 3 + 2));
-    } else {
-      o.i0 = (u32) * (u32 *)index_data.at(4 * (id * 3 + 0));
-      o.i1 = (u32) * (u32 *)index_data.at(4 * (id * 3 + 1));
-      o.i2 = (u32) * (u32 *)index_data.at(4 * (id * 3 + 2));
-    }
-    return o;
-  }
-
-  Triangle_Full fetch_triangle(u32 id) {
-    Tri_Index   tind = get_tri_index(id);
-    Vertex_Full v0   = fetch_vertex(tind.i0);
-    Vertex_Full v1   = fetch_vertex(tind.i1);
-    Vertex_Full v2   = fetch_vertex(tind.i2);
-    return {v0, v1, v2};
-  }
-  Vertex_Full interpolate_vertex(u32 index, float2 uv) {
-    Triangle_Full face = fetch_triangle(index);
-    Vertex_Full   v0   = face.v0;
-    Vertex_Full   v1   = face.v1;
-    Vertex_Full   v2   = face.v2;
-    float         k1   = uv.x;
-    float         k2   = uv.y;
-    float         k0   = 1.0f - uv.x - uv.y;
-    Vertex_Full   vertex;
-    vertex.normal =
-        safe_normalize(v0.normal * k0 + v1.normal * k1 + v2.normal * k2);
-    vertex.position = v0.position * k0 + v1.position * k1 + v2.position * k2;
-    vertex.tangent =
-        safe_normalize(v0.tangent * k0 + v1.tangent * k1 + v2.tangent * k2);
-    vertex.binormal =
-        safe_normalize(v0.binormal * k0 + v1.binormal * k1 + v2.binormal * k2);
-    vertex.u0 = v0.u0 * k0 + v1.u0 * k1 + v2.u0 * k2;
-    vertex.u1 = v0.u1 * k0 + v1.u1 * k1 + v2.u1 * k2;
-    vertex.u2 = v0.u2 * k0 + v1.u2 * k1 + v2.u2 * k2;
-    vertex.u3 = v0.u3 * k0 + v1.u3 * k1 + v2.u3 * k2;
-    return vertex;
-  }
-};
-
-struct Transform_Node {
-  float3     offset;
-  quat       rotation;
-  float      scale;
-  float4x4   transform_cache;
-  Array<u32> meshes;
-  Array<u32> children;
-  void       init() {
-    MEMZERO(*this);
-    meshes.init();
-    children.init();
-    scale           = 1.0f;
-    transform_cache = float4x4(1.0f);
-  }
-  void release() {
-    meshes.release();
-    children.release();
-    MEMZERO(*this);
-  }
-  void update_cache(float4x4 const &parent = float4x4(1.0f)) {
-    transform_cache = parent * get_transform();
-  }
-  float4x4 get_transform() {
-    //  return transform;
-    return glm::translate(float4x4(1.0f), offset) * (float4x4)rotation *
-           glm::scale(float4x4(1.0f), float3(scale, scale, scale));
-  }
-  float4x4 get_cofactor() {
-    mat4 out{};
-    mat4 transform = get_transform();
-    cofactor(&transform[0][0], &out[0][0]);
-  }
-};
-
-// To make things simple we use one format of meshes
-struct PBR_Model {
-  Array<Image2D_Raw>     images;
-  Array<Raw_Mesh_Opaque> meshes;
-  Array<PBR_Material>    materials;
-  Array<Transform_Node>  nodes;
-
-  void init() {
-    images.init();
-    meshes.init();
-    materials.init();
-    nodes.init();
-  }
-  void release() {
-    ito(images.size) images[i].release();
-    images.release();
-    ito(meshes.size) meshes[i].release();
-    meshes.release();
-    materials.release();
-    ito(nodes.size) nodes[i].release();
-    nodes.release();
-  }
-};
 
 struct vCollision {
   vfloat3 pos;
@@ -870,385 +434,228 @@ void sort_test() {
   }
 }
 
-void calculate_dim(const aiScene *scene, aiNode *node, vec3 &min, vec3 &max) {
-  for (unsigned int i = 0; i < node->mNumMeshes; i++) {
-    aiMesh *mesh = scene->mMeshes[node->mMeshes[i]];
-    for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
-      kto(3) max[k] = std::max(max[k], mesh->mVertices[i][k]);
-      kto(3) min[k] = std::min(min[k], mesh->mVertices[i][k]);
-    }
-  }
-  for (unsigned int i = 0; i < node->mNumChildren; i++) {
-    calculate_dim(scene, node->mChildren[i], min, max);
-  }
-}
-
-Image2D_Raw load_image(string_ref filename,
-                       Format_t   format = Format_t::RGBA8_SRGB) {
-  TMP_STORAGE_SCOPE;
-  if (stref_find(filename, stref_s(".hdr")) != -1) {
-    int            width, height, channels;
-    unsigned char *result;
-    FILE *         f = stbi__fopen(stref_to_tmp_cstr(filename), "rb");
-    ASSERT_PANIC(f);
-    stbi__context s;
-    stbi__start_file(&s, f);
-    stbi__result_info ri;
-    memset(&ri, 0, sizeof(ri));
-    ri.bits_per_channel = 8;
-    ri.channel_order    = STBI_ORDER_RGB;
-    ri.num_channels     = 0;
-    float *hdr = stbi__hdr_load(&s, &width, &height, &channels, STBI_rgb, &ri);
-
-    fclose(f);
-    ASSERT_PANIC(hdr);
-    Image2D_Raw out;
-    out.init(width, height, Format_t::RGB32_FLOAT, (u8 *)hdr);
-    stbi_image_free(hdr);
-    return out;
-  } else {
-    int  width, height, channels;
-    auto image = stbi_load(stref_to_tmp_cstr(filename), &width, &height,
-                           &channels, STBI_rgb_alpha);
-    ASSERT_PANIC(image);
-    Image2D_Raw out;
-    out.init(width, height, format, image);
-    stbi_image_free(image);
-    return out;
-  }
-}
-
-void traverse_node(PBR_Model &out, aiNode *node, const aiScene *scene,
-                   string_ref dir, u32 parent_id, float vk) {
-  Transform_Node tnode;
-  tnode.init();
-  float4x4 transform;
-  ito(4) {
-    jto(4) { transform[i][j] = node->mTransformation[j][i]; }
-  }
-  vec3 offset;
-  vec3 scale;
-
-  ito(3) {
-    scale[i] =
-        glm::length(vec3(transform[0][i], transform[1][i], transform[2][i]));
-  }
-
-  offset = vec3(transform[3][0], transform[3][1], transform[3][2]);
-
-  mat3 rot_mat;
-
-  ito(3) {
-    jto(3) { rot_mat[i][j] = transform[i][j] / scale[i]; }
-  }
-  quat rotation(rot_mat);
-
-  //  tnode.offset = offset;
-  //  tnode.rotation = rotation;
-  //    tnode.transform = transform;
-
-  for (unsigned int i = 0; i < node->mNumMeshes; i++) {
-    aiMesh *mesh = scene->mMeshes[node->mMeshes[i]];
-    // No support for animated meshes
-    ASSERT_PANIC(!mesh->HasBones());
-    Raw_Mesh_Opaque opaque_mesh;
-    opaque_mesh.init();
-    using GLRF_Vertex_t      = Vertex_Full;
-    opaque_mesh.num_vertices = mesh->mNumVertices;
-    opaque_mesh.num_indices  = mesh->mNumFaces * 3;
-    opaque_mesh.attribute_data.reserve(sizeof(GLRF_Vertex_t) *
-                                       mesh->mNumVertices);
-    opaque_mesh.index_data.reserve(sizeof(u32) * 3 * mesh->mNumFaces);
-    auto write_bytes = [&](u8 *src, size_t size) {
-      ito(size) opaque_mesh.attribute_data.push(src[i]);
-    };
-    auto write_index_data = [&](u8 *src, size_t size) {
-      ito(size) opaque_mesh.index_data.push(src[i]);
-    };
-    bool has_textcoords    = mesh->HasTextureCoords(0);
-    bool has_tangent_space = mesh->HasTangentsAndBitangents() && has_textcoords;
-    ////////////////////////
-    for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
-      GLRF_Vertex_t vertex;
-      MEMZERO(vertex);
-      vertex.position.x = mesh->mVertices[i].x * vk;
-      vertex.position.y = mesh->mVertices[i].y * vk;
-      vertex.position.z = mesh->mVertices[i].z * vk;
-      if (has_tangent_space) {
-        vertex.tangent.x = mesh->mTangents[i].x;
-        vertex.tangent.y = mesh->mTangents[i].y;
-        vertex.tangent.z = mesh->mTangents[i].z;
-
-      } else {
-        vertex.tangent = float3(0.0f, 0.0f, 0.0f);
-      }
-      if (has_tangent_space) {
-        vertex.binormal.x = mesh->mBitangents[i].x;
-        vertex.binormal.y = mesh->mBitangents[i].y;
-        vertex.binormal.z = mesh->mBitangents[i].z;
-
-      } else {
-        vertex.binormal = float3(0.0f, 0.0f, 0.0f);
-      }
-
-      vertex.normal.x = mesh->mNormals[i].x;
-      vertex.normal.y = mesh->mNormals[i].y;
-      vertex.normal.z = mesh->mNormals[i].z;
-      if (has_tangent_space) {
-        // An attempt to fix the tangent space
-        if (std::isnan(vertex.binormal.x) || std::isnan(vertex.binormal.y) ||
-            std::isnan(vertex.binormal.z)) {
-          vertex.binormal =
-              glm::normalize(glm::cross(vertex.normal, vertex.tangent));
-        }
-        if (std::isnan(vertex.tangent.x) || std::isnan(vertex.tangent.y) ||
-            std::isnan(vertex.tangent.z)) {
-          vertex.tangent =
-              glm::normalize(glm::cross(vertex.normal, vertex.binormal));
-        }
-        ASSERT_PANIC(!std::isnan(vertex.binormal.x) &&
-                     !std::isnan(vertex.binormal.y) &&
-                     !std::isnan(vertex.binormal.z));
-        ASSERT_PANIC(!std::isnan(vertex.tangent.x) &&
-                     !std::isnan(vertex.tangent.y) &&
-                     !std::isnan(vertex.tangent.z));
-      }
-      if (has_textcoords) {
-        vertex.u0.x = mesh->mTextureCoords[0][i].x;
-        vertex.u0.y = mesh->mTextureCoords[0][i].y;
-      } else {
-        vertex.u0 = glm::vec2(0.0f, 0.0f);
-      }
-      write_bytes((u8 *)&vertex, sizeof(vertex));
-    }
-    for (unsigned int i = 0; i < mesh->mNumFaces; ++i) {
-      aiFace face = mesh->mFaces[i];
-      for (unsigned int j = 0; j < face.mNumIndices; ++j) {
-        write_index_data((u8 *)&face.mIndices[j], 4);
-      }
-    }
-    opaque_mesh.index_type = Index_t::U32;
-
-    aiMaterial * material = scene->mMaterials[mesh->mMaterialIndex];
-    PBR_Material out_material;
-    MEMZERO(out_material);
-    float     metal_base;
-    float     roughness_base;
-    aiColor4D albedo_base;
-    material->Get(AI_MATKEY_GLTF_PBRMETALLICROUGHNESS_BASE_COLOR_FACTOR,
-                  albedo_base);
-    material->Get(AI_MATKEY_GLTF_PBRMETALLICROUGHNESS_METALLIC_FACTOR,
-                  metal_base);
-    material->Get(AI_MATKEY_GLTF_PBRMETALLICROUGHNESS_ROUGHNESS_FACTOR,
-                  roughness_base);
-    out_material.metal_factor     = metal_base;
-    out_material.roughness_factor = roughness_base;
-    out_material.albedo_factor =
-        vec4(albedo_base.r, albedo_base.g, albedo_base.b, albedo_base.a);
-    for (int tex = aiTextureType_NONE; tex <= aiTextureType_UNKNOWN; tex++) {
-      aiTextureType type = static_cast<aiTextureType>(tex);
-
-      if (material->GetTextureCount(type) > 0) {
-        aiString relative_path;
-
-        material->GetTexture(type, 0, &relative_path);
-        char full_path[0x100];
-        snprintf(full_path, sizeof(full_path), "%.*s/%s", STRF(dir),
-                 relative_path.C_Str());
-        Format_t format = Format_t::RGBA8_SRGB;
-
-        switch (type) {
-        case aiTextureType_NORMALS:
-          format                 = Format_t::RGBA8_UNORM;
-          out_material.normal_id = i32(out.images.size);
-          break;
-        case aiTextureType_DIFFUSE:
-          out_material.albedo_id = i32(out.images.size);
-          break;
-
-        case aiTextureType_SPECULAR:
-        case aiTextureType_SHININESS:
-        case aiTextureType_REFLECTION:
-        case aiTextureType_UNKNOWN:
-          //        case aiTextureType_AMBIENT:
-          // @Cleanup :(
-          // Some models downloaded from sketchfab have metallic-roughness
-          // imported as unknown/lightmap and have (ao, roughness, metalness)
-          // as components
-        case aiTextureType_LIGHTMAP:
-          format              = Format_t::RGBA8_UNORM;
-          out_material.arm_id = i32(out.images.size);
-          break;
-        default:
-          fprintf(stderr, "[LOAD][WARNING] Unrecognized image type\n");
-          //          ASSERT_PANIC(false && "Unsupported texture type");
-          break;
-        }
-        out.images.push(load_image(stref_s(full_path), format));
-      } else {
-      }
-    }
-    opaque_mesh.vertex_stride = sizeof(GLRF_Vertex_t);
-    // clang-format off
-    opaque_mesh.attributes.push({Attribute_t::POSITION, Format_t::RGB32_FLOAT, OFFSETOF(Vertex_Full, position)});
-    opaque_mesh.attributes.push({Attribute_t::NORMAL,   Format_t::RGB32_FLOAT, OFFSETOF(Vertex_Full, normal)});
-    if (has_tangent_space) {
-        opaque_mesh.attributes.push({Attribute_t::BINORMAL, Format_t::RGB32_FLOAT, OFFSETOF(Vertex_Full, binormal)});
-        opaque_mesh.attributes.push({Attribute_t::TANGENT,  Format_t::RGB32_FLOAT, OFFSETOF(Vertex_Full, tangent)});
-    }
-    if (has_textcoords) {
-        opaque_mesh.attributes.push({Attribute_t::UV0,      Format_t::RG32_FLOAT,  OFFSETOF(Vertex_Full, u0)});
-        opaque_mesh.attributes.push({Attribute_t::UV1,      Format_t::RG32_FLOAT,  OFFSETOF(Vertex_Full, u1)});
-        opaque_mesh.attributes.push({Attribute_t::UV2,      Format_t::RG32_FLOAT,  OFFSETOF(Vertex_Full, u2)});
-        opaque_mesh.attributes.push({Attribute_t::UV3,      Format_t::RG32_FLOAT,  OFFSETOF(Vertex_Full, u3)});
-    }
-    out.materials.push(out_material);
-    out.meshes.push(opaque_mesh);
-    tnode.meshes.push(u32(out.meshes.size - 1));
-  }
-  out.nodes.push(tnode);
-  out.nodes[parent_id].children.push(u32(out.nodes.size - 1));
-  for (unsigned int i = 0; i < node->mNumChildren; i++) {
-    traverse_node(out, node->mChildren[i], scene, dir,
-                  u32(out.nodes.size - 1), vk);
-  }
-}
-
-PBR_Model load_gltf_pbr(string_ref filename) {
-  Assimp::Importer importer;
-  PBR_Model        out;
-  out.init();
-  out.nodes.push(Transform_Node{});
-  string_ref dir_path = get_dir(filename);
-  TMP_STORAGE_SCOPE;
-  const aiScene *scene =
-      importer.ReadFile(stref_to_tmp_cstr(filename),
-                        aiProcess_Triangulate |              //
-                            aiProcess_GenSmoothNormals |     //
-                            aiProcess_PreTransformVertices | //
-                            aiProcess_OptimizeMeshes |       //
-                            aiProcess_CalcTangentSpace |     //
-                            aiProcess_FlipUVs);
-  if (!scene) {
-    fprintf(stderr, "[FILE] Errors: %s\n", importer.GetErrorString());
-    ASSERT_PANIC(false);
-  }
-  vec3 max = vec3(-1.0e10f);
-  vec3 min = vec3(1.0e10f);
-  calculate_dim(scene, scene->mRootNode, min, max);
-  vec3 max_dims = max - min;
-
-  // Size normalization hack
-  float vk      = 1.0f;
-  float max_dim = std::max(max_dims.x, std::max(max_dims.y, max_dims.z));
-  vk            = 50.0f / max_dim;
-  vec3 avg      = (max + min) / 2.0f;
-  traverse_node(out, scene->mRootNode, scene, dir_path, 0, vk);
-
-  out.nodes[0].offset = -avg * vk;
-  return out;
-}
-
 struct Camera {
-    float3 position;
-    float3 look;
-    float3 up;
-    float3 right;
-    float fov;
+  float3 position;
+  float3 look;
+  float3 up;
+  float3 right;
+  float  fov;
 };
-Camera gen_camera(
-    float  phi,
-    float  theta,
-    float  r,
-    float3 lookat,
-    float  fov) {
-    Camera cam;
-    cam.position    =  r * float3(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi));
-    cam.look   =  -normalize(cam.position);
-    cam.position    += lookat;
-    cam.right  =  -normalize(cross(cam.look, float3(0.0, 1.0, 0.0)));
-    cam.up     =  -cross(cam.right, cam.look);
-    cam.fov    =  fov;
-    return cam;
+Camera gen_camera(float phi, float theta, float r, float3 lookat, float fov) {
+  Camera cam;
+  cam.position =
+      r * float3(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi));
+  cam.look = -normalize(cam.position);
+  cam.position += lookat;
+  cam.right = -normalize(cross(cam.look, float3(0.0, 1.0, 0.0)));
+  cam.up    = -cross(cam.right, cam.look);
+  cam.fov   = fov;
+  return cam;
 }
 Ray gen_ray(Camera cam, float2 uv) {
-    Ray r;
-    r.o = cam.position;
-    r.d = normalize(cam.look + cam.fov * (cam.right * uv.x + cam.up * uv.y));
-    return r;
+  Ray r;
+  r.o = cam.position;
+  r.d = normalize(cam.look + cam.fov * (cam.right * uv.x + cam.up * uv.y));
+  return r;
 }
 
-struct Scene {
-    PBR_Model model;
-    Random_Factory rf;
-    Array<BVH> bvhs;
-     Pool<Tri> tri_pool;
+// Poor man's queue
+// Not thread safe in all scenarios but kind of works in mine
+// @Cleanup
+template <typename Job_t> struct Queue {
+  Array<Job_t>     job_queue;
+  std::atomic<u32> head = 0;
+  std::mutex       mutex;
+  void             init() {
+    job_queue.init();
+    job_queue.resize(512 * 512 * 256);
+  }
+  void  release() { job_queue.release(); }
+  Job_t dequeue() {
+    ASSERT_PANIC(head);
+    u32  old_head = head.fetch_sub(1);
+    auto back     = job_queue[old_head - 1];
 
-    void init(string_ref filename) {
-     model = load_gltf_pbr(filename);  
-      bvhs.init();
-
-      tri_pool = Pool<Tri>::create(1 << 20);
-      kto (model.meshes.size) {
-         Raw_Mesh_Opaque &mesh = model.meshes[k];
-         tri_pool.reset();
-         Tri *tris = tri_pool.alloc(mesh.num_indices / 3);
-         u32 num_tris = mesh.num_indices / 3;
-         ito (num_tris) {
-            Triangle_Full ftri = mesh.fetch_triangle(i);
-            tris[i].a = ftri.v0.position;
-            tris[i].b = ftri.v1.position;
-            tris[i].c = ftri.v2.position;
-            tris[i].id = i;
-         }
-         BVH bvh;
-         bvh.init(tris, num_tris);
-         bvhs.push(bvh);
-        }
-
+    return back;
+  }
+  // called in a single thread
+  void dequeue(Job_t *out, u32 &count) {
+    if (head < count) {
+      count = head;
     }
+    u32 old_head = head.fetch_sub(count);
+    memcpy(out, &job_queue[head], count * sizeof(out[0]));
+  }
+  void enqueue(Job_t job) {
+    //      std::scoped_lock<std::mutex> sl(mutex);
+    ASSERT_PANIC(!std::isnan(job.ray_dir.x) && !std::isnan(job.ray_dir.y) &&
+                 !std::isnan(job.ray_dir.z));
+    u32 old_head        = head.fetch_add(1);
+    job_queue[old_head] = job;
+    ASSERT_PANIC(head < job_queue.size);
+  }
+  void enqueue(Job_t const *jobs, u32 num) {
+    u32 old_head = head.fetch_add(num);
+    ASSERT_PANIC(head < job_queue.size);
+    memcpy(&job_queue[old_head], jobs, num * sizeof(Job_t));
+  }
+  bool has_job() { return head != 0u; }
+  void reset() { head = 0u; }
+};
 
-    float3 trace(float3 ro, float3 rd, Collision &col, u32 depth = 0) {
-      if (depth == 3)
-          return float3(0.0f, 0.0f, 0.0f);
-      bool hit = false;
-      col.t = 1.0e10f;
-      kto(model.meshes.size) {
-                BVH &bvh = bvhs[k];
-                bvh.traverse(ro, rd, [&](Tri &tri) {
-                    Collision c;
-                    if (ray_triangle_test_moller(ro, rd, tri.a, tri.b, tri.c, c)) {
-                      if (c.t < col.t) {
-                        hit = true;
-                        col = c;
-                        col.mesh_id = k;
-                        col.face_id = tri.id;
-                      }
-                    }
-                });
+template <typename Job_t> struct Job_System {
+  struct JobDesc {
+    u32 offset, size;
+  };
+  using JobFunc = std::function<void(JobDesc)>;
+  struct JobPayload {
+    JobFunc func;
+    JobDesc desc;
+  };
 
-            }
-      if (!hit) {
-        return float3(1.0f, 1.0f, 1.0f) * std::abs(rd.y);    
-      } else {
-          const u32 N = 128 >> depth;
-          float3 res= float3(0.0f, 0.0f, 0.0f);
-          ito (N) {
-          float3 rn = rf.sample_lambert_BRDF(col.normal);
-          Collision new_col;
-          res += trace(col.position + 1.0e-4f * col.normal, rn, new_col, depth + 1);    
-        }
-          return res / float(N);
-      }
+  u32               jobs_per_item     = 8 * 32 * 1000;
+  bool              use_jobs          = true;
+  u32               max_jobs_per_iter = 16 * 16 * 32 * 1000;
+  Array<JobPayload> work;
+  Array<Job_t>      cur_work;
+  Queue<Job_t>      queue;
+
+  template <typename F> void flush(F fn) {
+    while (queue.has_job()) {
+      iter(fn);
+    }
   }
 
-    void release() {
-          ito(bvhs.size) bvhs[i].release();    
-      bvhs.release();
-
-      tri_pool.release();
-      model.release();
+  void exec_queue() {
+    marl::WaitGroup wg(work.size);
+    for (u32 i = 0; i < work.size; i++) {
+      marl::schedule([=] {
+        defer(wg.done());
+        auto item = work[i];
+        item.func(item.desc);
+      });
     }
+    wg.wait();
+  }
+
+  template <typename F> void iter(F fn) {
+    cur_work.resize(max_jobs_per_iter);
+    u32 jobs_this_iter = max_jobs_per_iter;
+    queue.dequeue(&cur_work[0], jobs_this_iter);
+    work.reserve((jobs_this_iter + jobs_per_item - 1) / jobs_per_item);
+    ito((jobs_this_iter + jobs_per_item - 1) / jobs_per_item) {
+      JobPayload pl;
+      pl.func = [this, fn](JobDesc const &desc) {
+        fn(queue, &cur_work[desc.offset], desc.size);
+      };
+      pl.desc =
+          JobDesc{i * jobs_per_item,
+                  MIN(u32(jobs_this_iter) - i * jobs_per_item, jobs_per_item)};
+      work.push(pl);
+    }
+    exec_queue();
+  }
+
+  void init() {
+    cur_work.init();
+    queue.init();
+    work.init();
+  }
+
+  void release() {
+    queue.release();
+    cur_work.release();
+    work.release();
+  }
+};
+
+struct Scene {
+  // 3D model + materials
+  PBR_Model   model;
+  Array<BVH>  bvhs;
+  Pool<Tri>   tri_pool;
+  Image2D_Raw env_spheremap;
+
+  // Array<float4> normal_rt;
+  // Array<float4> albedo_rt;
+
+  void init(string_ref filename, string_ref env_filename) {
+
+    model         = load_gltf_pbr(filename);
+    env_spheremap = load_image(env_filename);
+    bvhs.init();
+    tri_pool = Pool<Tri>::create(1 << 20);
+    kto(model.meshes.size) {
+      Raw_Mesh_Opaque &mesh = model.meshes[k];
+      tri_pool.reset();
+      Tri *tris     = tri_pool.alloc(mesh.num_indices / 3);
+      u32  num_tris = mesh.num_indices / 3;
+      ito(num_tris) {
+        Triangle_Full ftri = mesh.fetch_triangle(i);
+        tris[i].a          = ftri.v0.position;
+        tris[i].b          = ftri.v1.position;
+        tris[i].c          = ftri.v2.position;
+        tris[i].id         = i;
+      }
+      BVH bvh;
+      bvh.init(tris, num_tris);
+      bvhs.push(bvh);
+    }
+  }
+
+  float4 env_value(float3 ray_dir, float3 color) {
+    if (env_spheremap.data == NULL) {
+      return float4(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+    float  theta = std::acos(ray_dir.y);
+    float2 xy    = normalize(float2(ray_dir.z, -ray_dir.x));
+    float  phi   = -std::atan2(xy.x, xy.y);
+    return float4(color, 1.0f) *
+           env_spheremap.sample(float2((phi / PI / 2.0f) + 0.5f, theta / PI));
+  };
+
+  bool collide(float3 ro, float3 rd, Collision &col) {
+    col.t    = FLT_MAX;
+    bool hit = false;
+    kto(model.meshes.size) {
+      BVH &bvh = bvhs[k];
+      bvh.traverse(ro, rd, [&](Tri &tri) {
+        Collision c;
+        if (ray_triangle_test_moller(ro, rd, tri.a, tri.b, tri.c, c)) {
+          if (c.t < col.t) {
+            hit         = true;
+            col         = c;
+            col.mesh_id = k;
+            col.face_id = tri.id;
+          }
+        }
+      });
+    }
+    return hit;
+    /*if (!hit) {
+      float4 env_val = env_value(rd, float3(1.0f, 1.0f, 1.0f));
+      return float3(env_val.x, env_val.y, env_val.z);
+    } else {
+      PBR_Material &mat = model.materials[col.mesh_id];
+      const u32     N   = 16 >> depth;
+      float3        res = float3(0.0f, 0.0f, 0.0f);
+      ito(N) {
+        float3    rn = rf.sample_lambert_BRDF(col.normal);
+        Collision new_col;
+        res +=
+            trace(col.position + 1.0e-4f * col.normal, rn, new_col, depth + 1);
+      }
+      return res / float(N);
+    }*/
+  }
+
+  void release() {
+    ito(bvhs.size) bvhs[i].release();
+    bvhs.release();
+    env_spheremap.release();
+    tri_pool.release();
+    model.release();
+  }
 };
 
 uint32_t rgba32f_to_rgba8_unorm(float r, float g, float b, float a) {
@@ -1278,49 +685,124 @@ uint32_t rgba32f_to_srgba8_unorm(float r, float g, float b, float a) {
 int main(int argc, char *argv[]) {
   (void)argc;
   (void)argv;
-  //vec_test();
-  //sort_test();
+  // vec_test();
+  // sort_test();
   Scene scene;
-  //scene.init(stref_s("models/human_bust_sculpt/scene.gltf"));
-  scene.init(stref_s("models/tree_low-poly_3d_model/scene.gltf"));
-  defer(scene.release());
-  int2 iResolution = int2(512, 512);
-  float2 m = float2(0.0f, 0.0f);
+   scene.init(stref_s("models/human_bust_sculpt/scene.gltf"),
+  //scene.init(stref_s("models/tree_low-poly_3d_model/scene.gltf"),
+             stref_s("env/lythwood_field_2k.hdr"));
+  struct Path_Tracing_Job {
+    float3 ray_origin;
+    float3 ray_dir;
+    // Color weight applied to the sampled light
+    vec3 color;
+    u32  pixel_x, pixel_y;
+    f32  weight;
+    // For visibility checks
+    u32 light_id;
+    u32 depth,
+        // Used to track down bugs
+        _depth;
+  };
+  Job_System<Path_Tracing_Job> js;
+  Array<float4>                rt0;
+  marl::Scheduler::Config      cfg;
+  int2                         iResolution = int2(512, 512);
+  cfg.setWorkerThreadCount(marl::Thread::numLogicalCPUs());
+  marl::Scheduler scheduler(cfg);
+  scheduler.bind();
+  js.init();
+  rt0.init();
+  rt0.resize(iResolution.x * iResolution.y);
+  rt0.memzero();
+  auto trace_primary = [&](u32 i, u32 j, float3 ro, float3 rd) {
+    Path_Tracing_Job job;
+    job.color      = float3(1.0f, 1.0f, 1.0f);
+    job.depth      = 0;
+    job._depth     = 0;
+    job.light_id   = 0;
+    job.pixel_x    = j;
+    job.pixel_y    = i;
+    job.ray_dir    = rd;
+    job.ray_origin = ro;
+    job.weight     = 1.0f;
+    js.queue.enqueue(job);
+  };
+  Array<vec3>      ray_dirs;
+  Array<vec3>      ray_origins;
+  Array<Collision> ray_collisions;
+  Random_Factory   rf[0x100];
+  ray_dirs.init();
+  ray_origins.init();
+  ray_collisions.init();
+  defer({
+    rt0.release();
+    js.release();
+    scheduler.unbind();
+    ray_dirs.release();
+    ray_origins.release();
+    ray_collisions.release();
+    scene.release();
+  });
+
+  float2      m  = float2(0.0f, 0.0f);
   const float PI = 3.141592654f;
-  Camera cam = gen_camera(
-        PI * 0.3f,
-        PI * 0.5,
-        45.0,
-        float3(0.0, 0.0, 0.0),
-        1.0
-      );
-      
+  Camera      cam =
+      gen_camera(PI * 0.3f, PI * 0.5, 45.0, float3(0.0, 10.0, 0.0), 1.0);
   {
-      u64 bvh_hits = 0;
-      u64 tri_hits = 0;
-      TMP_STORAGE_SCOPE;
-      u8 *rgb_image = (u8*)tl_alloc_tmp(iResolution.x * iResolution.y * 3);
-      #pragma omp parallel
-      #pragma omp for
-      for (i32 i = 0; i < (i32)iResolution.y; i++ ) {
+    TMP_STORAGE_SCOPE;
+    u8 * rgb_image = (u8 *)tl_alloc_tmp(iResolution.x * iResolution.y * 3);
+    auto retire    = [&](u32 i, u32 j, float3 d) {
+      u32 rgba8 = rgba32f_to_rgba8_unorm(d.r, d.g, d.b, 1.0f);
+      rgb_image[i * iResolution.x * 3 + j * 3 + 0] = (rgba8 >> 0) & 0xffu;
+      rgb_image[i * iResolution.x * 3 + j * 3 + 1] = (rgba8 >> 8) & 0xffu;
+      rgb_image[i * iResolution.x * 3 + j * 3 + 2] = (rgba8 >> 16) & 0xffu;
+    };
+    //while (true) {
+      ito(iResolution.y) {
         jto(iResolution.x) {
-            float2 uv = float2((float(j) + 0.5f) / iResolution.y, (float(iResolution.y - i - 1) + 0.5f) / iResolution.y) * 2.0f - 1.0f;
-            Ray ray = gen_ray(cam, uv);
-            u8 intersects = 0;
-            Collision col;
-            float3 d = scene.trace(ray.o, ray.d, col);
-                u32 rgba8 = rgba32f_to_rgba8_unorm(d.r, d.g, d.b, 1.0f);
-                rgb_image[i * iResolution.x * 3 + j * 3 + 0] = (rgba8 >> 0)  & 0xffu;
-                rgb_image[i * iResolution.x * 3 + j * 3 + 1] = (rgba8 >> 8)  & 0xffu;
-                rgb_image[i * iResolution.x * 3 + j * 3 + 2] = (rgba8 >> 16) & 0xffu;
-           
+          float2 uv =
+              float2((float(j) + 0.5f) / iResolution.y,
+                     (float(iResolution.y - i - 1) + 0.5f) / iResolution.y) *
+                  2.0f -
+              1.0f;
+          Ray ray        = gen_ray(cam, uv);
+          u8  intersects = 0;
+          trace_primary(i, j, ray.o, ray.d);
         }
       }
-      /*fprintf(stdout, "%lu %lu\n", bvh_hits, tri_hits);*/
-      write_image_2d_i24_ppm("image.ppm", rgb_image, iResolution.x * 3, iResolution.x, iResolution.y);
+      js.flush([&](Queue<Path_Tracing_Job> &queue, Path_Tracing_Job *jobs,
+                   u32 size) {
+        // ray_dirs.resize(jobs_this_iter);
+        // ray_origins.resize(jobs_this_iter);
+        // ray_collisions.resize(jobs_this_iter);
+        /* ito(jobs_this_iter) {
+           ray_dirs[i]         = cur_work[i].ray_dir;
+           ray_origins[i]      = cur_work[i].ray_origin;
+           ray_collisions[i].t = FLT_MAX;
+         }*/
+        ZoneScoped;
+        ito(size) {
+          Path_Tracing_Job job = jobs[i];
+          Collision        col;
+          bool   collide = scene.collide(job.ray_origin, job.ray_dir, col);
+          float3 result;
+          if (collide) {
+            result = float3(1.0f, 0.0f, 0.0f);
+          } else {
+            result = float3(0.0f, 0.0f, 0.0f);
+          }
+          //rt0[iResolution.x * job.pixel_y + job.pixel_x] +=
+              //float4(result.x, result.y, result.z, 1.0f);
+           retire(job.pixel_y, job.pixel_x, result);
+        }
+      });
+    //}
+     write_image_2d_i24_ppm("image.ppm", rgb_image, iResolution.x * 3,
+                           iResolution.x, iResolution.y);
   }
-  #ifdef UTILS_TL_IMPL_DEBUG
+#ifdef UTILS_TL_IMPL_DEBUG
   assert_tl_alloc_zero();
-  #endif
+#endif
   return 0;
 }
