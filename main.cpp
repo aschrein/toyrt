@@ -762,11 +762,12 @@ struct BVH_Node {
   static constexpr u32 ITEMS_OFFSET_SHIFT = 0;         // low bits
   static constexpr u32 NUM_ITEMS_MASK     = 0b1111111; // 7 bits
   static constexpr u32 NUM_ITEMS_SHIFT    = 24;        // after first 24 bits
-  static constexpr u32 MAX_ITEMS          = 4;         // max items
+  static constexpr u32 MAX_ITEMS          = 2;         // max items
   // Node flags:
   static constexpr u32 FIRST_CHILD_MASK  = 0xffffff;
   static constexpr u32 FIRST_CHILD_SHIFT = 0;
-  static constexpr u32 MAX_DEPTH         = 16;
+  static constexpr u32 MAX_DEPTH         = 20;
+  static constexpr f32 EPS               = 1.0e-3f;
 
   float3 min;
   float3 max;
@@ -794,19 +795,16 @@ struct BVH_Node {
   }
   bool intersects_ray(float3 ro, float3 rd) {
     if (inside(ro)) return true;
-    float3 orig = (min + max) / 2.0f;
-    float3 size = (max - min) / 2.0f;
-    float3 dr   = orig - ro;
     float3 invd = 1.0f / rd;
-    float  dx_n = (dr.x - size.x) * invd.x;
-    float  dy_n = (dr.y - size.y) * invd.y;
-    float  dz_n = (dr.z - size.z) * invd.z;
-    float  dx_f = (dr.x + size.x) * invd.x;
-    float  dy_f = (dr.y + size.y) * invd.y;
-    float  dz_f = (dr.z + size.z) * invd.z;
+    float  dx_n = (min.x - ro.x) * invd.x;
+    float  dy_n = (min.y - ro.y) * invd.y;
+    float  dz_n = (min.z - ro.z) * invd.z;
+    float  dx_f = (max.x - ro.x) * invd.x;
+    float  dy_f = (max.y - ro.y) * invd.y;
+    float  dz_f = (max.z - ro.z) * invd.z;
     float  nt   = MAX3(MIN(dx_n, dx_f), MIN(dy_n, dy_f), MIN(dz_n, dz_f));
     float  ft   = MIN3(MAX(dx_n, dx_f), MAX(dy_n, dy_f), MAX(dz_n, dz_f));
-    return nt < ft;
+    return nt < ft + EPS;
   }
   void init_leaf(float3 min, float3 max, u32 offset) {
     flags = LEAF_BIT;
@@ -869,7 +867,8 @@ struct BVH_Helper {
     ito(3) max[i] = MAX(max[i], tmax[i]);
   }
   void split(u32 max_items, u32 depth = 0) {
-    if (tris.size >= max_items && depth < BVH_Node::MAX_DEPTH) {
+    ASSERT_DEBUG(depth < BVH_Node::MAX_DEPTH);
+    if (tris.size > max_items && depth < BVH_Node::MAX_DEPTH) {
       left = new BVH_Helper;
       left->init();
       left->reserve(tris.size / 2);
@@ -914,7 +913,7 @@ struct BVH_Helper {
             max_dim_id   = i;
           }
         }
-        u32 split_index = last_item / 2;
+        u32 split_index = (last_item + 1) / 2;
         ito(num_items) {
           u32 tri_id = sorted_dims[max_dim_id][i].id;
           Tri tri    = tris[tri_id];
@@ -947,7 +946,9 @@ struct BVH {
     ASSERT_ALWAYS(node != NULL);
     ASSERT_ALWAYS(hnode != NULL);
     if (hnode->is_leaf) {
+      ASSERT_DEBUG(hnode->tris.size != 0);
       node->init_leaf(hnode->min, hnode->max, alloc_tri_chunk());
+      ASSERT_DEBUG(hnode->tris.size <= BVH_Node::MAX_ITEMS);
       node->set_num_items(hnode->tris.size);
       Tri *tris = tri_pool.at(node->items_offset());
       ito(hnode->tris.size) { tris[i] = hnode->tris[i]; }
@@ -966,7 +967,7 @@ struct BVH {
     ito(num_tris) { hroot->push(tris[i]); }
     hroot->split(BVH_Node::MAX_ITEMS);
     tri_pool  = Pool<Tri>::create(1 << 24);
-    node_pool = Pool<BVH_Node>::create(1 << 16);
+    node_pool = Pool<BVH_Node>::create(1 << 22);
     root      = node_pool.alloc(1);
     gen(root, hroot);
   }
@@ -1334,14 +1335,15 @@ int main(int argc, char *argv[]) {
   (void)argv;
   //vec_test();
   //sort_test();
-  PBR_Model model = load_gltf_pbr(stref_s("models/tree_low-poly_3d_model/scene.gltf"));
+  PBR_Model model = load_gltf_pbr(stref_s("models/human_bust_sculpt/scene.gltf"));
+  //PBR_Model model = load_gltf_pbr(stref_s("models/tree_low-poly_3d_model/scene.gltf"));
   int2 iResolution = int2(512, 512);
   float2 m = float2(0.0f, 0.0f);
   const float PI = 3.141592654f;
   Camera cam = gen_camera(
         0.0f,
-        PI / 4.0f,
-        60.0,
+        PI / 2.0f,
+        30.0,
         float3(0.0, 0.0, 0.0),
         1.4
       );
@@ -1370,25 +1372,30 @@ int main(int argc, char *argv[]) {
      bvhs.push(bvh);
     }
   {
+      u64 bvh_hits = 0;
+      u64 tri_hits = 0;
       TMP_STORAGE_SCOPE;
       u8 *rgb_image = (u8*)tl_alloc_tmp(iResolution.x * iResolution.y * 3);
       ito(iResolution.y) {
         jto(iResolution.x) {
             float2 uv = float2((float(j) + 0.5f) / iResolution.y, (float(iResolution.y - i - 1) + 0.5f) / iResolution.y) * 2.0f - 1.0f;
             Ray ray = gen_ray(cam, uv);
-            bool intersects = false;
+            u8 intersects = 0;
             kto(model.meshes.size) {
                 BVH &bvh = bvhs[k];
                 bvh.traverse(ray.o, ray.d, [&](Tri &tri) {
+                    bvh_hits++;
                     Collision c;
-                    if (ray_triangle_test_moller(ray.o, ray.d, tri.a, tri.b, tri.c, c))
-                        intersects = true;    
+                    if (ray_triangle_test_moller(ray.o, ray.d, tri.a, tri.b, tri.c, c)) {
+                        intersects++;    
+                        tri_hits++;
+                    }
                 });
 
             }
             if (intersects) {
-                rgb_image[i * iResolution.x * 3 + j * 3 + 0] = 255u;
-                rgb_image[i * iResolution.x * 3 + j * 3 + 1] = 0u;
+                rgb_image[i * iResolution.x * 3 + j * 3 + 0] = intersects * 100;
+                rgb_image[i * iResolution.x * 3 + j * 3 + 1] = intersects;
                 rgb_image[i * iResolution.x * 3 + j * 3 + 2] = 0u;
             } else {
                 rgb_image[i * iResolution.x * 3 + j * 3 + 0] = 0u;
@@ -1397,6 +1404,7 @@ int main(int argc, char *argv[]) {
             }
         }
       }
+      fprintf(stdout, "%lu %lu\n", bvh_hits, tri_hits);
       write_image_2d_i24_ppm("image.ppm", rgb_image, iResolution.x * 3, iResolution.x, iResolution.y);
   }
   model.release();
