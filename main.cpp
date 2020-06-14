@@ -1,8 +1,8 @@
 #include "rt.hpp"
 
-//#define TRACY_ENABLE 1
-//#define TRACY_HAS_CALLSTACK 1
-//#define TRACY_NO_EXIT 1
+#define TRACY_ENABLE 1
+#define TRACY_HAS_CALLSTACK 1
+#define TRACY_NO_EXIT 1
 #include <tracy/Tracy.hpp>
 
 #define UTILS_TL_IMPL 1
@@ -11,9 +11,10 @@
 #define UTILS_TL_TMP_SIZE 1 << 27
 #include "utils.hpp"
 
-#include <marl/scheduler.h>
-#include <marl/thread.h>
-#include <marl/waitgroup.h>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #define PACK_SIZE 16
 
@@ -492,7 +493,7 @@ struct Spin_Lock {
     while (!rw_flag.compare_exchange_strong(expected, 1)) {
       expected = 0;
       while (rw_flag.load() != 0) {
-        ito(16) nop(); // yield
+        nop(); // yield
       }
     }
   }
@@ -503,130 +504,162 @@ struct Spin_Lock {
 // Not thread safe in all scenarios but kind of works in mine
 // @Cleanup
 template <typename Job_t> struct Queue {
-  Job_t *          job_queue;
-  u32              capacity;
-  std::atomic<u32> head = 0;
-  Spin_Lock        spinlock;
-  void             lock() { spinlock.lock(); }
-  void             unlock() { spinlock.unlock(); }
-  void             init() {
-    ZoneScoped;
-    capacity  = 1 << 26;
-    job_queue = (Job_t *)tl_alloc(sizeof(Job_t) * capacity);
-  }
-  void release() { tl_free(job_queue); }
-  // Job_t dequeue() {
-  //  ZoneScoped;
-  //  lock();
-  //  defer(unlock());
-  //  ASSERT_PANIC(head);
-  //  u32  old_head = head.fetch_sub(1);
-  //  auto back     = job_queue[old_head - 1];
-
-  //  return back;
-  //}
-  // called in a single thread
-  void dequeue(Job_t *out, u32 &count) {
-    ZoneScoped;
-    lock();
-    defer(unlock());
-    if (head < count) {
-      count = head;
+  template <typename Job_t> struct Batch {
+    Job_t *          job_queue;
+    u32              capacity;
+    std::atomic<u32> head;
+    Spin_Lock        spinlock;
+      void lock() { spinlock.lock(); }
+    void unlock() { spinlock.unlock(); }
+    void             init() {
+      ZoneScoped;
+      head      = 0;
+      capacity  = 1 << 18;
+      job_queue = (Job_t *)tl_alloc(sizeof(Job_t) * capacity);
     }
-    u32 old_head = head.fetch_sub(count);
-    memcpy(out, job_queue + head, count * sizeof(out[0]));
-  }
-  void enqueue(Job_t job) {
-    ZoneScoped;
-    lock();
-    defer(unlock());
-    ASSERT_PANIC(!std::isnan(job.ray_dir.x) && !std::isnan(job.ray_dir.y) &&
-                 !std::isnan(job.ray_dir.z));
-    u32 old_head        = head.fetch_add(1);
-    job_queue[old_head] = job;
-    ASSERT_PANIC(head <= capacity);
-  }
-  void enqueue(Job_t const *jobs, u32 num) {
-    ZoneScoped;
-    u32 old_head = 0;
-    {
+    void release() { tl_free(job_queue); }
+
+    bool has_items() { return head.load() != 0; }
+    bool try_dequeue(Job_t &job) {
+      ZoneScoped;
       lock();
       defer(unlock());
-      old_head = head.fetch_add(num);
+      if (!has_items()) return false;
+      u32 old_head = head.fetch_sub(1);
+      job          = job_queue[old_head - 1];
+      return true;
+    }
+    void dequeue(Job_t *out, u32 &count) {
+      ZoneScoped;
+      lock();
+      defer(unlock());
+      if (head < count) {
+        count = head;
+      }
+      u32 old_head = head.fetch_sub(count);
+      memcpy(out, job_queue + head, count * sizeof(out[0]));
+    }
+    void enqueue(Job_t job) {
+      ZoneScoped;
+      lock();
+      defer(unlock());
+      ASSERT_PANIC(!std::isnan(job.ray_dir.x) && !std::isnan(job.ray_dir.y) &&
+                   !std::isnan(job.ray_dir.z));
+      u32 old_head        = head.fetch_add(1);
+      job_queue[old_head] = job;
       ASSERT_PANIC(head <= capacity);
     }
-    memcpy(job_queue + old_head, jobs, num * sizeof(Job_t));
-  }
-  bool has_job() { return head != 0u; }
-  void reset() { head = 0u; }
-};
-
-template <typename Job_t> struct Job_System {
-  // struct JobDesc {
-  //  u32 offset, size;
-  //};
-  // using JobFunc = std::function<void(JobDesc)>;
-  // struct JobPayload {
-  //  JobFunc func;
-  //  JobDesc desc;
-  //};
-
-  u32  jobs_per_item     = 8 * 32;
-  bool use_jobs          = true;
-  u32  max_jobs_per_iter = 1 << 20;
-  // Array<JobPayload> work;
-  Array<Job_t> cur_work;
-  Queue<Job_t> queue;
-
-  template <typename F> void flush(F fn) {
-    while (queue.has_job()) {
-      iter(fn);
+    void enqueue(Job_t const *jobs, u32 num) {
+      ZoneScoped;
+      u32 old_head = 0;
+      {
+        lock();
+        defer(unlock());
+        old_head = head.fetch_add(num);
+        ASSERT_PANIC(head <= capacity);
+      }
+      memcpy(job_queue + old_head, jobs, num * sizeof(Job_t));
     }
-  }
+    bool has_job() { return head != 0u; }
+    void reset() { head = 0u; }
+  };
 
-  void assert_empty() {
-    ASSERT_DEBUG(             //
-                              // work.size == 0 &&     //
-        cur_work.size == 0 && //
-        queue.head == 0);
-  }
-
-  template <typename F> void iter(F fn) {
-    FrameMark;
+  static constexpr u32 NUM_BATCHES = 512;
+  Batch<Job_t>         batches[NUM_BATCHES];
+  void                 init() {
     ZoneScoped;
-    cur_work.resize(max_jobs_per_iter);
-    u32 jobs_this_iter = max_jobs_per_iter;
-    queue.dequeue(&cur_work[0], jobs_this_iter);
-    // work.reserve((jobs_this_iter + jobs_per_item - 1) / jobs_per_item);
-    u32 num_batches = (jobs_this_iter + jobs_per_item - 1) / jobs_per_item;
-    marl::WaitGroup wg(num_batches);
-    for (u32 i = 0; i < num_batches; i++) {
-      marl::schedule([=] {
-        defer(wg.done());
-        u32 batch_size =
-            MIN(u32(jobs_this_iter) - i * jobs_per_item, jobs_per_item);
-        fn(queue, &cur_work[i * jobs_per_item], batch_size);
-      });
-    }
-    wg.wait();
-    cur_work.reset();
-    // work.reset();
+    ito(NUM_BATCHES) { batches[i].init(); }
   }
-
-  void init() {
-    ZoneScoped;
-    cur_work.init();
-    queue.init();
-    // work.init();
-  }
-
   void release() {
     ZoneScoped;
-    queue.release();
-    cur_work.release();
-    // work.release();
+    ito(NUM_BATCHES) { batches[i].release(); }
   }
+  bool has_items_any() {
+    ito(NUM_BATCHES) if (batches[i].has_items()) return true;
+    return false;
+  }
+  bool has_items(u32 id) { return batches[id % NUM_BATCHES].has_items(); }
+  bool try_dequeue(u32 id, Job_t &job) {
+    return batches[id % NUM_BATCHES].try_dequeue(job);
+  }
+  void dequeue(u32 id, Job_t *out, u32 &count) {
+    return batches[id % NUM_BATCHES].dequeue(out, count);
+  }
+  void enqueue(u32 id, Job_t job) {
+    return batches[id % NUM_BATCHES].enqueue(job);
+  }
+  void enqueue(u32 id, Job_t const *jobs, u32 num) {
+    return batches[id % NUM_BATCHES].enqueue(jobs, num);
+  }
+  bool has_job(u32 id) { return batches[id % NUM_BATCHES].has_job(); }
 };
+
+// template <typename Job_t> struct Job_System {
+//  // struct JobDesc {
+//  //  u32 offset, size;
+//  //};
+//  // using JobFunc = std::function<void(JobDesc)>;
+//  // struct JobPayload {
+//  //  JobFunc func;
+//  //  JobDesc desc;
+//  //};
+//
+//  u32  jobs_per_item     = 8 * 32;
+//  bool use_jobs          = true;
+//  u32  max_jobs_per_iter = 1 << 20;
+//  // Array<JobPayload> work;
+//  Array<Job_t> cur_work;
+//  Queue<Job_t> queue;
+//
+//  template <typename F> void flush(F fn) {
+//    while (queue.has_job()) {
+//      iter(fn);
+//    }
+//  }
+//
+//  void assert_empty() {
+//    ASSERT_DEBUG(             //
+//                              // work.size == 0 &&     //
+//        cur_work.size == 0 && //
+//        queue.head == 0);
+//  }
+//
+//  template <typename F> void iter(F fn) {
+//    FrameMark;
+//    ZoneScoped;
+//    cur_work.resize(max_jobs_per_iter);
+//    u32 jobs_this_iter = max_jobs_per_iter;
+//    queue.dequeue(&cur_work[0], jobs_this_iter);
+//    // work.reserve((jobs_this_iter + jobs_per_item - 1) / jobs_per_item);
+//    u32 num_batches = (jobs_this_iter + jobs_per_item - 1) / jobs_per_item;
+//    marl::WaitGroup wg(num_batches);
+//    for (u32 i = 0; i < num_batches; i++) {
+//      marl::schedule([=] {
+//        defer(wg.done());
+//        u32 batch_size =
+//            MIN(u32(jobs_this_iter) - i * jobs_per_item, jobs_per_item);
+//        fn(queue, &cur_work[i * jobs_per_item], batch_size);
+//      });
+//    }
+//    wg.wait();
+//    cur_work.reset();
+//    // work.reset();
+//  }
+//
+//  void init() {
+//    ZoneScoped;
+//    cur_work.init();
+//    queue.init();
+//    // work.init();
+//  }
+//
+//  void release() {
+//    ZoneScoped;
+//    queue.release();
+//    cur_work.release();
+//    // work.release();
+//  }
+//};
 
 struct Scene {
   // 3D model + materials
@@ -740,8 +773,8 @@ int main(int argc, char *argv[]) {
   // vec_test();
   // sort_test();
   Scene scene;
-  scene.init(stref_s("models/human_bust_sculpt/scene.gltf"),
-             // scene.init(stref_s("models/tree_low-poly_3d_model/scene.gltf"),
+  // scene.init(stref_s("models/human_bust_sculpt/scene.gltf"),
+  scene.init(stref_s("models/tree_low-poly_3d_model/scene.gltf"),
              stref_s("env/autumn_forest_01_2k.hdr"));
   struct Path_Tracing_Job {
     float3 ray_origin;
@@ -756,21 +789,29 @@ int main(int argc, char *argv[]) {
         // Used to track down bugs
         _depth;
   };
-  Job_System<Path_Tracing_Job> js;
-  Array<float4>                rt0;
-  marl::Scheduler::Config      cfg;
-  int2                         iResolution = int2(1024, 1024);
-  cfg.setWorkerThreadCount(marl::Thread::numLogicalCPUs());
-  marl::Scheduler scheduler(cfg);
-  scheduler.bind();
-  js.init();
+  u32  jobs_per_item     = 8 * 32;
+  bool use_jobs          = true;
+  u32  max_jobs_per_iter = 1 << 20;
+  // Array<JobPayload> work;
+  Queue<Path_Tracing_Job> queue;
+  // Job_System<Path_Tracing_Job> js;
+  Array<float4> rt0;
+  // marl::Scheduler::Config      cfg;
+  int2 iResolution = int2(256, 256);
+  // cfg.setWorkerThreadCount(marl::Thread::numLogicalCPUs());
+  // marl::Scheduler scheduler(cfg);
+  // scheduler.bind();
+  // js.init();
+  queue.init();
   rt0.init();
   rt0.resize(iResolution.x * iResolution.y);
   rt0.memzero();
-  Spin_Lock rt0_lock;
+  Spin_Lock rt0_locks[0x100];
   auto      retire_rt0 = [&](u32 i, u32 j, float4 d) {
-    rt0_lock.lock();
-    defer(rt0_lock.unlock());
+    Spin_Lock &lock =
+        rt0_locks[hash_of((u64)i ^ hash_of((u64)j)) % ARRAY_SIZE(rt0_locks)];
+    lock.lock();
+    defer(lock.unlock());
     rt0[i * iResolution.x + j] += d;
   };
   auto trace_primary = [&](u32 i, u32 j, float3 ro, float3 rd) {
@@ -784,7 +825,7 @@ int main(int argc, char *argv[]) {
     job.ray_dir    = rd;
     job.ray_origin = ro;
     job.weight     = 1.0f;
-    js.queue.enqueue(job);
+    queue.enqueue((u32)(hash_of(i) ^ hash_of(j)), job);
   };
   // Array<vec3>      ray_dirs;
   // Array<vec3>      ray_origins;
@@ -794,25 +835,32 @@ int main(int argc, char *argv[]) {
   // ray_collisions.init();
   defer({
     rt0.release();
-    js.release();
-     scheduler.unbind();
+    // js.release();
+    // scheduler.unbind();
     // ray_dirs.release();
     // ray_origins.release();
     // ray_collisions.release();
     scene.release();
   });
+  u32 num_cpus = std::thread::hardware_concurrency();
+#if defined(_WIN32)
+  {
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    num_cpus = sysinfo.dwNumberOfProcessors;
+  }
+#endif
 
   float2      m  = float2(0.0f, 0.0f);
   const float PI = 3.141592654f;
   Camera      cam =
-      gen_camera(PI * 0.3f, PI * 0.5, 45.0, float3(0.0, 1.0, 0.0), 1.0);
+      gen_camera(PI * 0.3f, PI * 0.5, 45.0, float3(0.0, 30.0, 0.0), 1.0);
   {
     TMP_STORAGE_SCOPE;
     u8 * rgb_image    = (u8 *)tl_alloc_tmp(iResolution.x * iResolution.y * 3);
     auto retire_final = [&](u32 i, u32 j, float4 d) {
-      
-        d /= (d.w + 1.0e-6f);
-      //d *= 1.5f; 
+      d /= (d.w + 1.0e-6f);
+      // d *= 1.5f;
       u32 rgba8 = rgba32f_to_rgba8_unorm(d.r, d.g, d.b, 1.0f);
       rgb_image[i * iResolution.x * 3 + j * 3 + 0] = (rgba8 >> 0) & 0xffu;
       rgb_image[i * iResolution.x * 3 + j * 3 + 1] = (rgba8 >> 8) & 0xffu;
@@ -822,15 +870,15 @@ int main(int argc, char *argv[]) {
     struct Per_HW_Thread {
       Random_Factory          rfs;
       Array<Path_Tracing_Job> local_queue;
-      std::atomic<u32>        locked;
+      // std::atomic<u32>        locked;
 
-      void lock() { locked.store(1); }
-      bool try_lock() {
-        u32 expected = 0;
-        return locked.compare_exchange_strong(expected, 1);
-      }
-      bool is_free() { return locked.load() == 0; }
-      void unlock() { locked.store(0); }
+      // void lock() { locked.store(1); }
+      // bool try_lock() {
+      //  u32 expected = 0;
+      //  return locked.compare_exchange_strong(expected, 1);
+      //}
+      // bool is_free() { return locked.load() == 0; }
+      // void unlock() { locked.store(0); }
       void init() { local_queue.init(); }
       void release() { local_queue.release(); }
     };
@@ -838,14 +886,14 @@ int main(int argc, char *argv[]) {
     ito(ARRAY_SIZE(phw)) phw[i].init();
     defer({ ito(ARRAY_SIZE(phw)) phw[i].release(); });
 
-    auto alloc_hw_resource = [&](u64 id) {
-      Per_HW_Thread *res = &phw[id % ARRAY_SIZE(phw)];
-      while (!res->try_lock()) {
-        id  = hash_of(id);
-        res = &phw[id % ARRAY_SIZE(phw)];
-      }
-      return res;
-    };
+    // auto alloc_hw_resource = [&](u64 id) {
+    //  Per_HW_Thread *res = &phw[id % ARRAY_SIZE(phw)];
+    //  while (!res->try_lock()) {
+    //    id  = hash_of(id);
+    //    res = &phw[id % ARRAY_SIZE(phw)];
+    //  }
+    //  return res;
+    //};
 
     float2 halton_cache[128];
     ito(128) {
@@ -872,76 +920,115 @@ int main(int argc, char *argv[]) {
           }
         }
       }
-      std::atomic<u32> rays_traced = 0;
-      std::atomic<u32> rays_hit    = 0;
-      std::atomic<u32> rays_misses = 0;
+      std::atomic<u32> rays_traced         = 0;
+      std::atomic<u32> rays_hit            = 0;
+      std::atomic<u32> rays_misses         = 0;
+      std::atomic<u32> workers_in_progress = 0;
 
-      js.flush([&](Queue<Path_Tracing_Job> &queue, Path_Tracing_Job *jobs,
-                   u32 size) {
-        // ray_dirs.resize(jobs_this_iter);
-        // ray_origins.resize(jobs_this_iter);
-        // ray_collisions.resize(jobs_this_iter);
-        /* ito(jobs_this_iter) {
-           ray_dirs[i]         = cur_work[i].ray_dir;
-           ray_origins[i]      = cur_work[i].ray_origin;
-           ray_collisions[i].t = FLT_MAX;
-         }*/
-        ZoneScoped;
-        const u32      MAX_SECONDARY = 2;
-        Per_HW_Thread *res           = alloc_hw_resource(get_thread_id());
-        defer(res->unlock());
-        res->local_queue.reset();
-        res->local_queue.init();
-        res->local_queue.reserve((size_t)size * MAX_SECONDARY);
-        u32 rays_emited = 0;
-        jto(size) {
-          Path_Tracing_Job job = jobs[j];
-          rays_traced++;
-          Collision col;
-          bool      collide = scene.collide(job.ray_origin, job.ray_dir, col);
-          if (collide) {
-            if (job.depth == 2) {
-              retire_rt0(job.pixel_y, job.pixel_x,
-                         float4(0.0f, 0.0f, 0.0f, job.weight));
-              goto next_job;
+      bool                    working = true;
+      std::mutex              cv_mux;
+      std::condition_variable cv;
+      std::mutex              finished_mux;
+      std::condition_variable finished_cv;
+      std::thread *           thpool[0x100];
+      fprintf(stdout, "Launching %i threads\n", num_cpus);
+      for (u32 thread_id = 0; thread_id < num_cpus; thread_id++) {
+        thpool[thread_id] = new std::thread([&, thread_id] {
+        // Set affinity
+#if defined(_WIN32)
+          SetThreadAffinityMask(GetCurrentThread(), (u64)1 << (u64)thread_id);
+#endif // _WIN32
+          u32 batch_hash = thread_id;
+          while (working) {
+            batch_hash = (u32)hash_of(batch_hash);
+            if (queue.has_items(batch_hash) == false) {
+              finished_cv.notify_one();
+              ito(32) nop();
+              
+              /*std::unique_lock<std::mutex> lk(cv_mux);
+              cv.wait(lk,
+                      [&] { return !working || queue.has_items(batch_hash); });*/
+              if (!working) break;
+              continue;
             }
-            PBR_Model &   model = scene.model;
-            PBR_Material &mat   = model.materials[col.mesh_id];
-            const u32     N     = MAX_SECONDARY >> job.depth;
-            ito(N) {
-              float3           rn = res->rfs.sample_lambert_BRDF(col.normal);
-              Path_Tracing_Job new_job;
-              MEMZERO(new_job);
-              new_job.color      = float3(1.0f, 1.0f, 1.0f);
-              new_job.depth      = job.depth + 1;
-              new_job._depth     = 0;
-              new_job.light_id   = 0;
-              new_job.pixel_x    = job.pixel_x;
-              new_job.pixel_y    = job.pixel_y;
-              new_job.ray_dir    = rn;
-              new_job.ray_origin = col.position + 1.0e-4f * col.normal;
-              new_job.weight     = job.weight / N;
-              res->local_queue.push(new_job);
-              rays_emited++;
-            }
-            rays_hit++;
-          } else {
-            rays_misses++;
-            if (job.depth == 0) {
-              retire_rt0(job.pixel_y, job.pixel_x,
-                         float4(0.0f, 0.0f, 0.0f, job.weight));
+
+            workers_in_progress++;
+            defer({
+              workers_in_progress--;
+            });
+            ZoneScoped;
+            const u32      MAX_SECONDARY = 2;
+            Per_HW_Thread *res           = &phw[thread_id % ARRAY_SIZE(phw)];
+
+            res->local_queue.reset();
+            res->local_queue.reserve(MAX_SECONDARY);
+            u32 rays_emited = 0;
+
+            Path_Tracing_Job job;
+            if (!queue.try_dequeue(batch_hash, job)) continue;
+            rays_traced++;
+            Collision col;
+            bool      collide = scene.collide(job.ray_origin, job.ray_dir, col);
+            if (collide) {
+              if (job.depth == 2) {
+                retire_rt0(job.pixel_y, job.pixel_x,
+                           float4(0.0f, 0.0f, 0.0f, job.weight));
+                goto next_job;
+              }
+              PBR_Model &   model = scene.model;
+              PBR_Material &mat   = model.materials[col.mesh_id];
+              const u32     N     = MAX_SECONDARY >> job.depth;
+              ito(N) {
+                float3           rn = res->rfs.sample_lambert_BRDF(col.normal);
+                Path_Tracing_Job new_job;
+                MEMZERO(new_job);
+                new_job.color      = float3(1.0f, 1.0f, 1.0f);
+                new_job.depth      = job.depth + 1;
+                new_job._depth     = 0;
+                new_job.light_id   = 0;
+                new_job.pixel_x    = job.pixel_x;
+                new_job.pixel_y    = job.pixel_y;
+                new_job.ray_dir    = rn;
+                new_job.ray_origin = col.position + 1.0e-4f * col.normal;
+                new_job.weight     = job.weight / N;
+                res->local_queue.push(new_job);
+                rays_emited++;
+              }
+              rays_hit++;
             } else {
-              float4 env = scene.env_value(job.ray_dir, job.color);
-              env.w      = 1.0f;
-              retire_rt0(job.pixel_y, job.pixel_x, job.weight * env);
+              rays_misses++;
+              if (job.depth == 0) {
+                retire_rt0(job.pixel_y, job.pixel_x,
+                           float4(0.0f, 0.0f, 0.0f, job.weight));
+              } else {
+                float4 env = scene.env_value(job.ray_dir, job.color);
+                env.w      = 1.0f;
+                retire_rt0(job.pixel_y, job.pixel_x, job.weight * env);
+              }
             }
+
+            if (res->local_queue.size != 0)
+              queue.enqueue(batch_hash, &res->local_queue[0],
+                            res->local_queue.size);
+          next_job:
+            (void)0;
           }
-        next_job:
-          (void)0;
+        });
+        cv.notify_one();
+      }
+      {
+        std::unique_lock<std::mutex> lk(finished_mux);
+        finished_cv.wait(lk, [&] {
+          return queue.has_items_any() == false && workers_in_progress == 0;
+        });
+        working = false;
+
+        ito(num_cpus) {
+          cv.notify_all();
+          thpool[i]->join();
+          delete thpool[i];
         }
-        if (res->local_queue.size != 0)
-          js.queue.enqueue(&res->local_queue[0], res->local_queue.size);
-      });
+      }
       fprintf(stdout,
               "Finished a frame #%i;\n"
               "Traced Rays: %i\n"
@@ -950,7 +1037,6 @@ int main(int argc, char *argv[]) {
               frame_cnt, rays_traced.load(), rays_hit.load(),
               rays_misses.load());
       frame_cnt += 1;
-      js.assert_empty();
     }
     ito(iResolution.y) {
       jto(iResolution.x) { retire_final(i, j, rt0[i * iResolution.x + j]); }

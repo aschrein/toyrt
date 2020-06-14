@@ -1,9 +1,0 @@
-commit da0a9c610e0225f6e9b1af978c155c4efafc50b4
-Author: Ben Clayton <bclayton@google.com>
-Date:   Fri Jun 12 13:33:12 2020 +0100
-
-    Add basic CMake rules for versioning marl
-    
-    Version is currently set to a rather bland `0.0.0`.
-    
-    The first official 1.0.0 release will likely happen after the deprecated APIs are removed.
