@@ -10,8 +10,8 @@ utils.hpp
 )
 
 add_library(TracyClient STATIC 3rdparty/tracy/TracyClient.cpp)
-target_include_directories(TracyClient PUBLIC 3rdparty/tracy)
-target_compile_definitions(TracyClient PUBLIC TRACY_ENABLE=1)
+target_include_directories(TracyClient PRIVATE 3rdparty/tracy)
+target_compile_definitions(TracyClient PRIVATE TRACY_ENABLE=1)
 
 target_include_directories(toyrt
   PRIVATE

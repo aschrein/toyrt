@@ -813,9 +813,14 @@ struct Array {
       capacity = new_capacity;
     }
   }
+  T *alloc(size_t num) {
+    size_t old_cursor = size;
+    resize(size + num);
+    return ptr + old_cursor;
+  }
   void push(T elem) {
     if (size + 1 > capacity) {
-      uint64_t new_capacity = capacity + grow_k;
+      size_t new_capacity = capacity + grow_k;
       ptr      = (T *)Allcator_t::realloc(ptr, sizeof(T) * capacity,
                                      sizeof(T) * new_capacity);
       capacity = new_capacity;
@@ -1309,8 +1314,14 @@ void *tl_alloc(size_t size) {
   void *ptr          = malloc(size + sizeof(size_t));
   ((size_t *)ptr)[0] = size;
   return ((u8 *)ptr + 8);
-#endif
+#elif UTILS_TL_IMPL_TRACY
+  ZoneScopedS(16);
+  void *ptr = malloc(size);
+  TracyAllocS(ptr, size, 16);
+  return ptr;
+#else
   return malloc(size);
+#endif
 }
 
 static inline void *_tl_realloc(void *ptr, size_t oldsize, size_t newsize) {
@@ -1347,8 +1358,22 @@ void *tl_realloc(void *ptr, size_t oldsize, size_t newsize) {
       _tl_realloc(old_ptr, oldsize + sizeof(size_t), newsize + sizeof(size_t));
   ((size_t *)new_ptr)[0] = newsize;
   return ((u8 *)new_ptr + sizeof(size_t));
-#endif
+#elif UTILS_TL_IMPL_TRACY
+  ZoneScopedS(16);
+  size_t minsize = MIN(oldsize, newsize);
+  void * new_ptr = NULL;
+  if (newsize > 0) {
+    new_ptr = malloc(newsize);
+    TracyAllocS(new_ptr, newsize, 16);
+    if (minsize > 0) {
+        memcpy(new_ptr, ptr, minsize);
+    }
+  }
+  TracyFreeS(ptr, 16);
+  return new_ptr;
+#else
   return _tl_realloc(ptr, oldsize, newsize);
+#endif
 }
 
 void tl_free(void *ptr) {
@@ -1357,8 +1382,14 @@ void tl_free(void *ptr) {
   get_tl()->allocated -= (i64)size;
   free(((u8 *)ptr - sizeof(size_t)));
   return;
-#endif
+#elif UTILS_TL_IMPL_TRACY
+  ZoneScopedS(16);
+  TracyFreeS(ptr, 16);
   free(ptr);
+#else
+  free(ptr);
+#endif
+  
 }
 #endif // UTILS_TL_IMPL_H
 #endif // UTILS_TL_IMPL
