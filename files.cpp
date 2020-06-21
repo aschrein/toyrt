@@ -9,7 +9,6 @@
 #include <assimp/contrib/stb_image/stb_image.h>
 #include <assimp/pbrmaterial.h>
 
-
 void calculate_dim(const aiScene *scene, aiNode *node, vec3 &min, vec3 &max) {
   for (unsigned int i = 0; i < node->mNumMeshes; i++) {
     aiMesh *mesh = scene->mMeshes[node->mMeshes[i]];
@@ -23,8 +22,7 @@ void calculate_dim(const aiScene *scene, aiNode *node, vec3 &min, vec3 &max) {
   }
 }
 
-Image2D_Raw load_image(string_ref filename,
-                       Format_t   format) {
+Image2D_Raw load_image(string_ref filename, Format_t format) {
   TMP_STORAGE_SCOPE;
   if (stref_find(filename, stref_s(".hdr")) != -1) {
     int            width, height, channels;
@@ -88,14 +86,27 @@ void traverse_node(PBR_Model &out, aiNode *node, const aiScene *scene,
   //    tnode.transform = transform;
 
   for (unsigned int i = 0; i < node->mNumMeshes; i++) {
-    aiMesh *mesh = scene->mMeshes[node->mMeshes[i]];
+    aiMesh *mesh          = scene->mMeshes[node->mMeshes[i]];
+    u32     num_indices   = 0;
+    bool    crap_detected = false;
+    for (unsigned int i = 0; i < mesh->mNumFaces; ++i) {
+      aiFace face = mesh->mFaces[i];
+      num_indices += face.mNumIndices;
+      if (num_indices % 3 != 0) {
+        fprintf(stderr, "Blimey! Non triangular faces detected!\n");
+        crap_detected = true;
+      }
+      // ASSERT_DEBUG(face.mNumIndices % 3 == 0);
+    }
+    if (crap_detected) continue;
+
     // No support for animated meshes
     ASSERT_PANIC(!mesh->HasBones());
     Raw_Mesh_Opaque opaque_mesh;
     opaque_mesh.init();
     using GLRF_Vertex_t      = Vertex_Full;
     opaque_mesh.num_vertices = mesh->mNumVertices;
-    opaque_mesh.num_indices  = mesh->mNumFaces * 3;
+    opaque_mesh.num_indices  = num_indices;
     opaque_mesh.attribute_data.reserve(sizeof(GLRF_Vertex_t) *
                                        mesh->mNumVertices);
     opaque_mesh.index_data.reserve(sizeof(u32) * 3 * mesh->mNumFaces);
@@ -105,8 +116,11 @@ void traverse_node(PBR_Model &out, aiNode *node, const aiScene *scene,
     auto write_index_data = [&](u8 *src, size_t size) {
       ito(size) opaque_mesh.index_data.push(src[i]);
     };
-    bool has_textcoords    = mesh->HasTextureCoords(0);
-    bool has_tangent_space = mesh->HasTangentsAndBitangents() && has_textcoords;
+
+    bool has_textcoords = mesh->HasTextureCoords(0);
+    bool has_normals    = mesh->HasNormals();
+    bool has_tangent_space =
+        mesh->HasTangentsAndBitangents() && has_textcoords && has_normals;
     ////////////////////////
     for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
       GLRF_Vertex_t vertex;
@@ -130,10 +144,11 @@ void traverse_node(PBR_Model &out, aiNode *node, const aiScene *scene,
       } else {
         vertex.binormal = float3(0.0f, 0.0f, 0.0f);
       }
-
-      vertex.normal.x = mesh->mNormals[i].x;
-      vertex.normal.y = mesh->mNormals[i].y;
-      vertex.normal.z = mesh->mNormals[i].z;
+      if (has_normals) {
+        vertex.normal.x = mesh->mNormals[i].x;
+        vertex.normal.y = mesh->mNormals[i].y;
+        vertex.normal.z = mesh->mNormals[i].z;
+      }
       if (has_tangent_space) {
         // An attempt to fix the tangent space
         if (std::isnan(vertex.binormal.x) || std::isnan(vertex.binormal.y) ||
@@ -231,7 +246,8 @@ void traverse_node(PBR_Model &out, aiNode *node, const aiScene *scene,
     opaque_mesh.vertex_stride = sizeof(GLRF_Vertex_t);
     // clang-format off
     opaque_mesh.attributes.push({Attribute_t::POSITION, Format_t::RGB32_FLOAT, OFFSETOF(Vertex_Full, position)});
-    opaque_mesh.attributes.push({Attribute_t::NORMAL,   Format_t::RGB32_FLOAT, OFFSETOF(Vertex_Full, normal)});
+    if (has_normals)
+        opaque_mesh.attributes.push({Attribute_t::NORMAL,   Format_t::RGB32_FLOAT, OFFSETOF(Vertex_Full, normal)});
     if (has_tangent_space) {
         opaque_mesh.attributes.push({Attribute_t::BINORMAL, Format_t::RGB32_FLOAT, OFFSETOF(Vertex_Full, binormal)});
         opaque_mesh.attributes.push({Attribute_t::TANGENT,  Format_t::RGB32_FLOAT, OFFSETOF(Vertex_Full, tangent)});

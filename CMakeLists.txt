@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.4.3)
 project(toyrt)
 add_subdirectory(3rdparty/assimp)
-add_subdirectory(3rdparty/marl)
 add_executable(toyrt
 main.cpp
 files.cpp
@@ -22,6 +21,5 @@ target_include_directories(toyrt
 )
 target_link_libraries(toyrt
 TracyClient
-marl
 assimp
 )
