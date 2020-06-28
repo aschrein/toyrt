@@ -31,6 +31,21 @@ using i8  = int8_t;
 using i32 = int32_t;
 using f32 = float;
 using f64 = double;
+#undef MIN
+#undef MAX
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
+#define MIN3(x, y, z) MIN(x, MIN(y, z))
+#define MAX(x, y) ((x) > (y) ? (x) : (y))
+#define MAX3(x, y, z) MAX(x, MAX(y, z))
+#define CLAMP(x, a, b) ((x) < (a) ? (a) : ((x) > (b) ? (b) : (x)))
+#define OFFSETOF(class, field) ((unsigned int) (size_t) & (((class *)0)->field))
+#define MEMZERO(x) memset(&x, 0, sizeof(x))
+#define ito(N) for (uint32_t i = 0; i < N; ++i)
+#define jto(N) for (uint32_t j = 0; j < N; ++j)
+#define uto(N) for (uint32_t u = 0; u < N; ++u)
+#define kto(N) for (uint32_t k = 0; k < N; ++k)
+#define xto(N) for (uint32_t x = 0; x < N; ++x)
+#define yto(N) for (uint32_t y = 0; y < N; ++y)
 
 #if __linux__
 // UNIX headers
@@ -92,16 +107,6 @@ static void restore_fpe(u32 new_mask) {
 #define ATTR_USED
 #endif
 
-#undef MIN
-#undef MAX
-#define MIN(x, y) ((x) < (y) ? (x) : (y))
-#define MIN3(x, y, z) MIN(x, MIN(y, z))
-#define MAX(x, y) ((x) > (y) ? (x) : (y))
-#define MAX3(x, y, z) MAX(x, MAX(y, z))
-#define CLAMP(x, a, b) ((x) < (a) ? (a) : ((x) > (b) ? (b) : (x)))
-#define OFFSETOF(class, field) ((size_t) & (((class *)0)->field))
-#define MEMZERO(x) memset(&x, 0, sizeof(x))
-
 template <typename T> T copy(T const &in) { return in; }
 
 template <typename M, typename K> bool contains(M const &in, K const &key) {
@@ -158,13 +163,6 @@ template <typename F> __Defer__<F> defer_func(F f) { return __Defer__<F>(f); }
 
 #define STRINGIFY(a) _STRINGIFY(a)
 #define _STRINGIFY(a) #a
-
-#define ito(N) for (uint32_t i = 0; i < N; ++i)
-#define jto(N) for (uint32_t j = 0; j < N; ++j)
-#define uto(N) for (uint32_t u = 0; u < N; ++u)
-#define kto(N) for (uint32_t k = 0; k < N; ++k)
-#define xto(N) for (uint32_t x = 0; x < N; ++x)
-#define yto(N) for (uint32_t y = 0; y < N; ++y)
 
 #define PERF_HIST_ADD(name, val)
 #define PERF_ENTER(name)
@@ -821,9 +819,9 @@ struct Array {
   void push(T elem) {
     if (size + 1 > capacity) {
       size_t new_capacity = capacity + grow_k;
-      ptr      = (T *)Allcator_t::realloc(ptr, sizeof(T) * capacity,
+      ptr                 = (T *)Allcator_t::realloc(ptr, sizeof(T) * capacity,
                                      sizeof(T) * new_capacity);
-      capacity = new_capacity;
+      capacity            = new_capacity;
     }
     ASSERT_DEBUG(capacity >= size + 1);
     ASSERT_DEBUG(ptr != NULL);
@@ -1110,166 +1108,6 @@ struct Hash_Table {
     }
   }
 };
-
-//#ifdef UTILS_AVX512
-
-#include <immintrin.h>
-
-struct vfloat {
-  static constexpr u32 WIDTH = 16;
-  __m512               val;
-  vfloat               operator+(vfloat const &that) const {
-    vfloat r;
-    r.val =
-        _mm512_add_ps(_mm512_load_ps(&this->val), _mm512_load_ps(&that.val));
-    return r;
-  }
-  vfloat operator-(vfloat const &that) const {
-    vfloat r;
-    r.val =
-        _mm512_sub_ps(_mm512_load_ps(&this->val), _mm512_load_ps(&that.val));
-    return r;
-  }
-  vfloat operator/(vfloat const &that) const {
-    vfloat r;
-    r.val =
-        _mm512_div_ps(_mm512_load_ps(&this->val), _mm512_load_ps(&that.val));
-    return r;
-  }
-  vfloat operator*(vfloat const &that) const {
-    vfloat r;
-    r.val =
-        _mm512_mul_ps(_mm512_load_ps(&this->val), _mm512_load_ps(&that.val));
-    return r;
-  }
-  static vfloat splat(f32 a) {
-    vfloat r;
-    r.val = _mm512_broadcastss_ps(_mm_set_ss(a));
-    return r;
-  }
-  f32 &operator[](u32 i) { return val.m512_f32[i]; }
-  f32  operator[](u32 i) const { return val.m512_f32[i]; }
-};
-
-#define SOP(OP)                                                                \
-  static inline vfloat operator OP(f32 a, vfloat const &vf) {                  \
-    vfloat       va = vfloat::splat(a);                                        \
-    return va OP vf;                                                           \
-  }
-SOP(/)
-SOP(*)
-SOP(+)
-SOP(-)
-#undef SOP
-#define SOP(OP)                                                                \
-  static inline vfloat operator OP(vfloat const &vf, f32 a) {                  \
-    vfloat       va = vfloat::splat(a);                                        \
-    return vf OP va;                                                           \
-  }
-SOP(/)
-SOP(*)
-SOP(+)
-SOP(-)
-#undef SOP
-
-struct vfloat3 {
-  vfloat x;
-  vfloat y;
-  vfloat z;
-#define VOP(OP)                                                                \
-  vfloat3 operator OP(vfloat3 const &that) const {                             \
-    vfloat3          r;                                                        \
-    r.x = this->x OP that.x;                                                   \
-    r.y = this->y OP that.y;                                                   \
-    r.z = this->z OP that.z;                                                   \
-    return r;                                                                  \
-  }
-  VOP(+)
-  VOP(-)
-  VOP(*)
-  VOP(/)
-#undef VOP
-  //
-  vfloat dot(vfloat3 const &that) const {
-    vfloat rx, ry, rz;
-    rx        = this->x * that.x;
-    ry        = this->y * that.y;
-    rz        = this->z * that.z;
-    vfloat rs = rx + ry + rz;
-    return rs;
-  }
-  vfloat length2() const { return dot(*this); }
-  vfloat ilength() const {
-    vfloat r = length2();
-    r.val    = _mm512_rsqrt14_ps(r.val);
-    return r;
-  }
-  vfloat3 normalize() const {
-    vfloat  ilen = ilength();
-    vfloat3 r;
-    r.x = this->x * ilen;
-    r.y = this->y * ilen;
-    r.z = this->z * ilen;
-    return r;
-  }
-  static vfloat3 splat(f32 x) {
-    vfloat3 r;
-    r.x = vfloat::splat(x);
-    r.y = vfloat::splat(x);
-    r.z = vfloat::splat(x);
-    return r;
-  }
-  static vfloat3 splat(f32 x, f32 y, f32 z) {
-    vfloat3 r;
-    r.x = vfloat::splat(x);
-    r.y = vfloat::splat(y);
-    r.z = vfloat::splat(z);
-    return r;
-  }
-  void dump() const {
-    fprintf(stdout, "vfloat3:\n");
-    fprintf(stdout, "x:\n");
-    ito(16) fprintf(stdout, " %f ", x.val.m512_f32[i]);
-    fprintf(stdout, "\n");
-    fprintf(stdout, "y:\n");
-    ito(16) fprintf(stdout, " %f ", y.val.m512_f32[i]);
-    fprintf(stdout, "\n");
-    fprintf(stdout, "z:\n");
-    ito(16) fprintf(stdout, " %f ", z.val.m512_f32[i]);
-    fprintf(stdout, "\n");
-  }
-};
-
-#define SOP(OP)                                                                \
-  static inline vfloat3 operator OP(f32 a, vfloat3 const &vf) {                \
-    vfloat      va = vfloat::splat(a);                                         \
-    vfloat3     r;                                                             \
-    r.x = va OP vf.x;                                                          \
-    r.y = va OP vf.y;                                                          \
-    r.z = va OP vf.z;                                                          \
-    return r;                                                                  \
-  }
-SOP(/)
-SOP(*)
-SOP(+)
-SOP(-)
-#undef SOP
-#define SOP(OP)                                                                \
-  static inline vfloat3 operator OP(vfloat3 const &vf, f32 a) {                \
-    vfloat        va = vfloat::splat(a);                                       \
-    vfloat3       r;                                                           \
-    r.x = vf.x OP va;                                                          \
-    r.y = vf.y OP va;                                                          \
-    r.z = vf.z OP va;                                                          \
-    return r;                                                                  \
-  }
-SOP(/)
-SOP(*)
-SOP(+)
-SOP(-)
-#undef SOP
-
-//#endif // UTILS_AVX512
 #endif
 
 #ifdef UTILS_TL_IMPL
@@ -1366,7 +1204,7 @@ void *tl_realloc(void *ptr, size_t oldsize, size_t newsize) {
     new_ptr = malloc(newsize);
     TracyAllocS(new_ptr, newsize, 16);
     if (minsize > 0) {
-        memcpy(new_ptr, ptr, minsize);
+      memcpy(new_ptr, ptr, minsize);
     }
   }
   TracyFreeS(ptr, 16);
@@ -1389,7 +1227,6 @@ void tl_free(void *ptr) {
 #else
   free(ptr);
 #endif
-  
 }
 #endif // UTILS_TL_IMPL_H
 #endif // UTILS_TL_IMPL
