@@ -7,7 +7,9 @@ files.cpp
 rt.hpp
 utils.hpp
 )
-
+# -Wall
+SET(CMAKE_CXX_FLAGS "-march=skylake-avx512 \
+${CMAKE_CXX_FLAGS}")
 add_library(TracyClient STATIC 3rdparty/tracy/TracyClient.cpp)
 target_include_directories(TracyClient PRIVATE 3rdparty/tracy)
 target_compile_definitions(TracyClient PRIVATE TRACY_ENABLE=1)

@@ -30,7 +30,10 @@ struct vbool {
   bool                 none() { return val == 0u; }
 
   operator __mmask16() { return val; }
-  
+
+  bool  is_enabled(u32 i) const { return (val & (1 << i)) != 0; }
+  void  enable(u32 i) { val = val | (1 << i); }
+  void  disable(u32 i) { val = val & ~(1 << i); }
   vbool operator!() const {
     vbool b;
     b.val = ~val;
@@ -61,6 +64,21 @@ struct vbool {
     b.val = val & (u16)that;
     return b;
   }
+  vbool operator|(i32 that) const {
+    vbool b;
+    b.val = val | (u16)that;
+    return b;
+  }
+  vbool operator|(u32 that) const {
+    vbool b;
+    b.val = val | (u16)that;
+    return b;
+  }
+  vbool operator|(u16 that) const {
+    vbool b;
+    b.val = val | (u16)that;
+    return b;
+  }
   vbool operator&(vbool const &that) const {
     vbool b;
     b.val = val & that.val;
@@ -77,6 +95,12 @@ struct vbool {
     return b;
   }
   void set(u32 i) { val |= (1 << i); }
+  void set(u32 i, bool t) { val = (val & ~(1 << i)) | ((t ? 1 : 0) << i); }
+  void dump() const {
+    fprintf(stdout, "vbool: ");
+    ito(16) fprintf(stdout, "%i", is_enabled(i) ? 1 : 0);
+    fprintf(stdout, "\n");
+  }
 };
 
 struct TL_Mask {
@@ -107,6 +131,16 @@ thread_local TL_Mask tl_mask;
 
 static inline TL_Mask &mask() { return tl_mask; }
 static inline vbool &  cur_vmask() { return tl_mask.current; }
+
+#define VIF(cond)                                                              \
+  do {                                                                         \
+    mask().push();                                                             \
+    cur_vmask() = cond;                                                        \
+  } while (0)
+#define VENDIF()                                                               \
+  do {                                                                         \
+    mask().pop();                                                              \
+  } while (0)
 
 struct vint {
   static constexpr u32 WIDTH = 16;
@@ -160,6 +194,7 @@ struct vint {
     b.val = cur_vmask() & _mm512_cmpneq_epi32_mask(this->val, that.val);
     return b;
   }
+  i32 &operator[](u32 i) { return raw[i]; }
   i32  operator[](u32 i) const { return raw[i]; }
   void dump() const {
     fprintf(stdout, "vint:\n");
@@ -257,10 +292,10 @@ struct vfloat {
     return b;
   }
   vbool operator>(vfloat const &that) const {
-    return vbool{cur_vmask()} & !(*this <= that);
+    return cur_vmask() && !(*this <= that);
   }
   vbool operator>=(vfloat const &that) const {
-    return vbool{cur_vmask()} & !(*this < that);
+    return cur_vmask() && !(*this < that);
   }
   vbool operator==(vfloat const &that) const {
     vbool b;
@@ -287,6 +322,16 @@ struct vfloat {
 #define VOP(OP)                                                                \
   vfloat operator OP##=(vfloat const &that) {                                  \
     *this = *this OP that;                                                     \
+    return *this;                                                              \
+  }
+  VOP(+)
+  VOP(-)
+  VOP(*)
+  VOP(/)
+#undef VOP
+#define VOP(OP)                                                                \
+  vfloat operator OP##=(f32 that) {                                            \
+    *this = *this OP splat(that);                                              \
     return *this;                                                              \
   }
   VOP(+)
@@ -364,11 +409,10 @@ struct vfloat3 {
 #undef VOP
 #define VOP(OP)                                                                \
   vfloat3 operator OP##=(vfloat3 const &that) {                                \
-    vfloat3 r;                                                                 \
     this->x OP## = that.x;                                                     \
     this->y OP## = that.y;                                                     \
     this->z OP## = that.z;                                                     \
-    return r;                                                                  \
+    return *this;                                                              \
   }
   VOP(+)
   VOP(-)
@@ -377,11 +421,22 @@ struct vfloat3 {
 #undef VOP
 #define VOP(OP)                                                                \
   vfloat3 operator OP##=(vfloat const &that) {                                 \
-    vfloat3 r;                                                                 \
     this->x OP## = that;                                                       \
     this->y OP## = that;                                                       \
     this->z OP## = that;                                                       \
-    return r;                                                                  \
+    return *this;                                                              \
+  }
+  VOP(+)
+  VOP(-)
+  VOP(*)
+  VOP(/)
+#undef VOP
+#define VOP(OP)                                                                \
+  vfloat3 operator OP##=(f32 that) {                                           \
+    this->x OP## = that;                                                       \
+    this->y OP## = that;                                                       \
+    this->z OP## = that;                                                       \
+    return *this;                                                              \
   }
   VOP(+)
   VOP(-)
@@ -459,7 +514,7 @@ struct vfloat3 {
     ito(16) fprintf(stdout, " %f ", z[i]);
     fprintf(stdout, "\n");
   }
-  float3 extract(u32 i) { return float3{x[i], y[i], z[i]}; }
+  float3 extract(u32 i) const { return float3{x[i], y[i], z[i]}; }
 };
 
 static inline vfloat vdot(vfloat3 const &a, vfloat3 const &b) {
@@ -471,11 +526,11 @@ static inline vfloat vsign(vfloat const &a) {
 }
 
 static inline vfloat vmax(vfloat const &a, vfloat const &b) {
-  return vfloat::blend(a, b, a > b);
+  return vfloat::blend(a, b, a < b);
 }
 
 static inline vfloat vmin(vfloat const &a, vfloat const &b) {
-  return vfloat::blend(a, b, a < b);
+  return vfloat::blend(a, b, a > b);
 }
 
 static inline vfloat vmax3(vfloat const &a, vfloat const &b, vfloat const &c) {
@@ -551,13 +606,6 @@ SOP(-)
 #undef SOP
 //#endif // UTILS_AVX512
 
-struct vCollision {
-  vint    mesh_id, face_id;
-  vfloat3 position;
-  vfloat3 normal;
-  vfloat  t, u, v;
-};
-
 struct vRay {
   vfloat3 o;
   vfloat3 d;
@@ -568,6 +616,24 @@ struct Collision {
   float3 position;
   float3 normal;
   float  t, u, v;
+};
+
+struct vCollision {
+  vint      mesh_id, face_id;
+  vfloat3   position;
+  vfloat3   normal;
+  vfloat    t, u, v;
+  Collision extract(u32 i) {
+    Collision col;
+    col.mesh_id  = mesh_id[i];
+    col.face_id  = face_id[i];
+    col.position = position.extract(i);
+    col.normal   = normal.extract(i);
+    col.t        = t[i];
+    col.v        = v[i];
+    col.u        = u[i];
+    return col;
+  }
 };
 
 // Möller–Trumbore intersection algorithm
@@ -612,12 +678,11 @@ static bool ray_triangle_test_moller(vec3 ray_origin, vec3 ray_dir, vec3 v0,
     return false;
 }
 
-static vbool vray_triangle_test_moller(vfloat3 ray_origin, vfloat3 ray_dir,
-                                       vfloat3 v0, vfloat3 v1, vfloat3 v2,
-                                       vCollision &out_collision) {
+static inline vbool vray_triangle_test_moller(vfloat3 ray_origin,
+                                              vfloat3 ray_dir, vfloat3 v0,
+                                              vfloat3 v1, vfloat3 v2,
+                                              vCollision &out_collision) {
   ZoneScopedS(16);
-  mask().push();
-  defer(mask().pop());
   // vfloat invlength = ray_dir.ilength();
   // ray_dir          = ray_dir * invlength;
 
@@ -629,28 +694,30 @@ static vbool vray_triangle_test_moller(vfloat3 ray_origin, vfloat3 ray_dir,
   h     = vcross(ray_dir, edge2);
   a     = vdot(edge1, h);
 
-  cur_vmask() = cur_vmask() && a > -EPSILON && a < EPSILON;
-  if (cur_vmask().none()) return cur_vmask();
+  vbool vmsk = cur_vmask();
+
+  vmsk = vmsk && !(a > -EPSILON && a < EPSILON);
+  if (vmsk.none()) return vmsk;
 
   f = 1.0 / a;
   s = ray_origin - v0;
   u = f * vdot(s, h);
 
-  cur_vmask() = cur_vmask() && u < 0.0f && u > 1.0f;
-  if (cur_vmask().none()) return cur_vmask();
+  vmsk = vmsk && !(u < 0.0f || u > 1.0f);
+  if (vmsk.none()) return vmsk;
 
   q = vcross(s, edge1);
   v = f * vdot(ray_dir, q);
 
-  cur_vmask() = cur_vmask() && v < 0.0 && u + v > 1.0;
-  if (cur_vmask().none()) return cur_vmask();
+  vmsk = vmsk && !(v < 0.0 || u + v > 1.0);
+  if (vmsk.none()) return vmsk;
 
   // At this stage we can compute t to find out where the intersection point
   // is on the line.
   vfloat t = f * vdot(edge2, q);
 
-  cur_vmask() = cur_vmask() && t > EPSILON;
-  if (cur_vmask().none()) return cur_vmask();
+  vmsk = vmsk && t > EPSILON;
+  if (vmsk.none()) return vmsk;
 
   out_collision.t      = t; // * invlength;
   out_collision.u      = u;
@@ -659,7 +726,7 @@ static vbool vray_triangle_test_moller(vfloat3 ray_origin, vfloat3 ray_dir,
   out_collision.normal *= vsign(-vdot(ray_dir, out_collision.normal));
   out_collision.position = ray_origin + ray_dir * t;
 
-  return cur_vmask();
+  return vmsk;
 }
 
 // Woop intersection algorithm
@@ -734,6 +801,33 @@ struct Tri {
 
 static_assert(sizeof(Tri) == 40, "Blamey!");
 
+struct vTri {
+  vint    id;
+  vfloat3 a;
+  vfloat3 b;
+  vfloat3 c;
+  void    store(u32 i, Tri const &tri) {
+    a.x[i] = tri.a.x;
+    a.y[i] = tri.a.y;
+    a.z[i] = tri.a.z;
+    b.x[i] = tri.b.x;
+    b.y[i] = tri.b.y;
+    b.z[i] = tri.b.z;
+    c.x[i] = tri.c.x;
+    c.y[i] = tri.c.y;
+    c.z[i] = tri.c.z;
+    id[i]  = tri.id;
+  }
+  Tri extract(u32 i) const {
+    Tri out;
+    out.id = id[i];
+    out.a  = a.extract(i);
+    out.b  = b.extract(i);
+    out.c  = c.extract(i);
+    return out;
+  }
+};
+
 struct BVH_Node {
   // Bit layout:
   // +-------------------------+
@@ -762,7 +856,7 @@ struct BVH_Node {
   static constexpr u32 ITEMS_OFFSET_SHIFT = 0;         // low bits
   static constexpr u32 NUM_ITEMS_MASK     = 0b1111111; // 7 bits
   static constexpr u32 NUM_ITEMS_SHIFT    = 24;        // after first 24 bits
-  static constexpr u32 MAX_ITEMS          = 4;         // max items
+  static constexpr u32 MAX_ITEMS          = 16;        // max items
   // Node flags:
   static constexpr u32 FIRST_CHILD_MASK  = 0xffffff;
   static constexpr u32 FIRST_CHILD_SHIFT = 0;
@@ -830,18 +924,52 @@ struct BVH_Node {
     if (nt > ft - EPS) return false;
     return true;
   }
-  vbool vintersects_ray(vfloat3 ro, vfloat3 rd) {
-    vbool   inside = vinside(ro);
-    vfloat3 invd   = 1.0f / rd;
-    vfloat  dx_n   = (min.x - ro.x) * invd.x;
-    vfloat  dy_n   = (min.y - ro.y) * invd.y;
-    vfloat  dz_n   = (min.z - ro.z) * invd.z;
-    vfloat  dx_f   = (max.x - ro.x) * invd.x;
-    vfloat  dy_f   = (max.y - ro.y) * invd.y;
-    vfloat  dz_f   = (max.z - ro.z) * invd.z;
-    vfloat  nt = vmax3(vmin(dx_n, dx_f), vmin(dy_n, dy_f), vmin(dz_n, dz_f));
-    vfloat  ft = vmin3(vmax(dx_n, dx_f), vmax(dy_n, dy_f), vmax(dz_n, dz_f));
-    return nt < ft + EPS || inside;
+  vbool vintersects_ray(vfloat3 vro, vfloat3 vrd) {
+    vbool vmsk = cur_vmask();
+    ito(16) {
+      if (vmsk.is_enabled(i)) {
+        vmsk.set(i, intersects_ray(vro.extract(i), vrd.extract(i)));
+      }
+    }
+    // return vmsk;
+    // vfloat3 vinvd = vfloat3::splat(1.0f, 1.0f, 1.0f) / vrd;
+    // vfloat  vdx_n = (min.x - vro.x) * vinvd.x;
+    // vfloat  vdy_n = (min.y - vro.y) * vinvd.y;
+    // vfloat  vdz_n = (min.z - vro.z) * vinvd.z;
+    // vfloat  vdx_f = (max.x - vro.x) * vinvd.x;
+    // vfloat  vdy_f = (max.y - vro.y) * vinvd.y;
+    // vfloat  vdz_f = (max.z - vro.z) * vinvd.z;
+    // vfloat  vnt =
+    //    vmax3(vmin(vdx_n, vdx_f), vmin(vdy_n, vdy_f), vmin(vdz_n, vdz_f));
+    // vfloat vft =
+    //    vmin3(vmax(vdx_n, vdx_f), vmax(vdy_n, vdy_f), vmax(vdz_n, vdz_f));
+    // vft -= EPS;
+    // vbool ret  = vnt < vft || vinside(vro);
+    // vbool vmsk = cur_vmask();
+    // ito(16) {
+    //  if (vmsk.is_enabled(i)) {
+    //    //vmsk.set(intersects_ray(vro.extract(i), vrd.extract(i)));
+    //    float3 ro = vro.extract(i);
+    //    float3 rd = vrd.extract(i);
+    //    if (inside(ro)) {
+    //      //ASSERT_ALWAYS(ret.is_enabled(i) == vmsk.is_enabled(i));
+    //    } else {
+    //      float3 invd = 1.0f / rd;
+    //      float  dx_n = (min.x - ro.x) * invd.x;
+    //      float  dy_n = (min.y - ro.y) * invd.y;
+    //      float  dz_n = (min.z - ro.z) * invd.z;
+    //      float  dx_f = (max.x - ro.x) * invd.x;
+    //      float  dy_f = (max.y - ro.y) * invd.y;
+    //      float  dz_f = (max.z - ro.z) * invd.z;
+    //      float  nt   = MAX3(MIN(dx_n, dx_f), MIN(dy_n, dy_f), MIN(dz_n,
+    //      dz_f)); float  ft   = MIN3(MAX(dx_n, dx_f), MAX(dy_n, dy_f),
+    //      MAX(dz_n, dz_f)); ft += EPS; if (nt > ft) vmsk.disable(i);
+    //      //ASSERT_ALWAYS(ret.is_enabled(i) == vmsk.is_enabled(i));
+    //    }
+    //  }
+    //}
+
+    return vmsk;
   }
   void init_leaf(float3 min, float3 max, u32 offset) {
     flags = LEAF_BIT;
@@ -977,7 +1105,7 @@ struct BVH_Helper {
 static_assert(sizeof(BVH_Node) == 28, "Blamey!");
 
 struct BVH {
-  Array<Tri>      tri_pool;
+  Array<vTri>     tri_pool;
   Array<BVH_Node> node_pool;
   BVH_Node *      root;
 
@@ -992,8 +1120,8 @@ struct BVH {
       node->init_leaf(hnode->min, hnode->max, tri_offset);
       ASSERT_DEBUG(hnode->tris.size <= BVH_Node::MAX_ITEMS);
       node->set_num_items(hnode->tris.size);
-      Tri *tris = tri_pool.at(node->items_offset());
-      ito(hnode->tris.size) { tris[i] = hnode->tris[i]; }
+      vTri *tris = tri_pool.at(node->items_offset());
+      ito(hnode->tris.size) { tris->store(i, hnode->tris[i]); }
     } else {
       BVH_Node *children = node_pool.alloc(2);
       node->init_branch(hnode->min, hnode->max, children);
@@ -1018,9 +1146,10 @@ struct BVH {
     gen(root, hroot);
   }
   u32 alloc_tri_chunk() {
-    Tri *new_chunk = tri_pool.alloc(BVH_Node::MAX_ITEMS);
-    Tri *tri_root  = tri_pool.at(0);
-    return (u32)(((u8 *)new_chunk - (u8 *)tri_root) / sizeof(Tri));
+    vTri *new_chunk = tri_pool.alloc(1);
+    MEMZERO(*new_chunk);
+    vTri *tri_root = tri_pool.at(0);
+    return (u32)(((u8 *)new_chunk - (u8 *)tri_root) / sizeof(vTri));
   }
   void release() {
     tri_pool.release();
@@ -1034,9 +1163,10 @@ struct BVH {
   void traverse(BVH_Node *node, float3 ro, float3 rd, F fn) {
     ZoneScoped;
     if (node->is_leaf()) {
-      Tri *tris     = tri_pool.at(node->items_offset());
-      u32  num_tris = node->num_items();
-      ito(num_tris) fn(tris[i]);
+      vTri *tris     = tri_pool.at(node->items_offset());
+      u32   num_tris = node->num_items();
+      ASSERT_ALWAYS(num_tris <= vfloat3::WIDTH);
+      fn(*tris);
     } else {
       BVH_Node *children = node->first_child();
       BVH_Node *left     = children + 0;
@@ -1046,6 +1176,11 @@ struct BVH {
     }
   }
   template <typename F> void vtraverse(vfloat3 ro, vfloat3 rd, F fn) {
+    // kto(16) {
+    //  if (mask().cur().is_enabled(k) &&
+    //      !root->intersects_ray(ro.extract(k), rd.extract(k)))
+    //    mask().disable(k);
+    //}
     mask().set(root->vintersects_ray(ro, rd));
     if (mask().cur().none()) return;
     vtraverse(root, ro, rd, fn);
@@ -1054,18 +1189,23 @@ struct BVH {
   void vtraverse(BVH_Node *node, vfloat3 ro, vfloat3 rd, F fn) {
     ZoneScoped;
     if (node->is_leaf()) {
-      Tri *tris     = tri_pool.at(node->items_offset());
-      u32  num_tris = node->num_items();
-      fn(tris, num_tris);
+      vTri *tris     = tri_pool.at(node->items_offset());
+      u32   num_tris = node->num_items();
+      ASSERT_ALWAYS(num_tris <= vfloat3::WIDTH);
+      fn(*tris);
     } else {
       BVH_Node *children = node->first_child();
       BVH_Node *left     = children + 0;
       BVH_Node *right    = children + 1;
       vbool     vmask    = mask().cur();
-      mask().set(vmask && left->vintersects_ray(ro, rd));
+
+      mask().set(left->vintersects_ray(ro, rd));
       if (mask().cur().any()) vtraverse(left, ro, rd, fn);
-      mask().set(vmask && right->vintersects_ray(ro, rd));
+      mask().set(vmask);
+
+      mask().set(right->vintersects_ray(ro, rd));
       if (mask().cur().any()) vtraverse(right, ro, rd, fn);
+      mask().set(vmask);
     }
   }
   /*template <typename F> void traverse(float3 ro, float3 rd, F fn) {
@@ -1094,31 +1234,43 @@ struct BVH {
 
 void vec_test() {
   mask().enable_all();
-  mask().disable(0);
-  mask().disable(5);
-  {
-    vfloat a = vfloat::splat(1.0f);
-    vfloat b = vfloat::splat(2.0f);
-    vfloat c = a + b;
-    mask().dump();
-    c.dump();
-  }
-  {
-    vfloat3 a = vfloat3::splat(1.0f, 2.0f, 3.0f);
-    vfloat3 b = vfloat3::splat(-2.0f, -3.0f, 5.0f);
+  // mask().disable(0);
+  // mask().disable(5);
+  //{
+  //  vfloat a = vfloat::splat(1.0f);
+  //  vfloat b = vfloat::splat(2.0f);
+  //  vfloat c = a + b;
+  //  mask().dump();
+  //  c.dump();
+  //}
+  //{
+  //  vfloat3 a = vfloat3::splat(1.0f, 2.0f, 3.0f);
+  //  vfloat3 b = vfloat3::splat(-2.0f, -3.0f, 5.0f);
 
-    vfloat3 c = (1.0f + a + b * 2.0f).normalize();
-    c.dump();
-    c.x = vsign(c.x);
-    c.y = vsign(c.y);
-    c.z = vsign(c.z);
-    c.dump();
-  }
+  //  vfloat3 c = (1.0f + a + b * 2.0f).normalize();
+  //  c.dump();
+  //  c.x = vsign(c.x);
+  //  c.y = vsign(c.y);
+  //  c.z = vsign(c.z);
+  //  c.dump();
+  //}
+  //{
+  //  vfloat3 a = vfloat3::splat(1.0f, 0.0f, 0.0f);
+  //  vfloat3 b = vfloat3::splat(0.0f, 4.0f, 0.0f);
+  //  vfloat3 c = vcross(a, b).normalize();
+  //  c.dump();
+  //}
   {
-    vfloat3 a = vfloat3::splat(1.0f, 0.0f, 0.0f);
-    vfloat3 b = vfloat3::splat(0.0f, 4.0f, 0.0f);
-    vfloat3 c = vcross(a, b).normalize();
-    c.dump();
+    vfloat a;
+    kto(16) { a[k] = (f32)k; }
+    vfloat b = vfloat::splat(5.0f);
+    a.dump();
+    b.dump();
+    (a + b).dump();
+    (a < b).dump();
+    (a > b).dump();
+    (a == b).dump();
+    (a > b || a == b || a < b).dump();
   }
 }
 
@@ -1353,60 +1505,113 @@ struct Scene {
       ZoneScoped;
 
       BVH &bvh = bvhs[k];
-      bvh.traverse(ro, rd, [&](Tri &tri) {
+      bvh.traverse(ro, rd, [&](vTri const &tri) {
         ZoneScoped;
+#if 1
+        vCollision vc;
+        vc.t          = vfloat::splat(FLT_MAX);
+        vbool cur_hit = vray_triangle_test_moller(
+            vfloat3::splat(ro), vfloat3::splat(rd), tri.a, tri.b, tri.c, vc);
+        if (cur_hit.none()) return col.t;
+        ito(16) {
+          if (!cur_hit.is_enabled(i)) continue;
+          Tri ntri = tri.extract(i);
+          if (vc.t[i] < col.t) {
+            hit         = true;
+            col         = vc.extract(i);
+            col.mesh_id = k;
+            col.face_id = ntri.id;
+          }
+        }
+        return col.t;
+#else
         Collision c;
         c.t = FLT_MAX;
-        if (ray_triangle_test_moller(ro, rd, tri.a, tri.b, tri.c, c)) {
-          if (c.t < col.t) {
-            hit         = true;
-            col         = c;
-            col.mesh_id = k;
-            col.face_id = tri.id;
+        ito(16) {
+          Tri ntri = tri.extract(i);
+          if (ray_triangle_test_moller(ro, rd, ntri.a, ntri.b, ntri.c, c)) {
+            if (c.t < col.t) {
+              hit         = true;
+              col         = c;
+              col.mesh_id = k;
+              col.face_id = ntri.id;
+            }
           }
         }
         return c.t;
+#endif
       });
     }
     return hit;
   }
 
-  vbool vcollide(vfloat3 ro, vfloat3 rd, vCollision &col) {
+  vbool vcollide(vfloat3 vro, vfloat3 vrd, vCollision &col) {
     ZoneScoped;
     col.t = vfloat::splat(FLT_MAX);
     vbool hit{0};
+    vbool vmsk = cur_vmask();
+
+    // kto(model.meshes.size) {
+    //  ZoneScoped;
+    //  BVH &bvh = bvhs[k];
+    //  mask().set(vmsk);
+    //  ito(16) {
+    //    float3 ro = vro.extract(i);
+    //    float3 rd = vrd.extract(i);
+
+    //    bvh.traverse(ro, rd, [&](vTri const &tri) {
+    //      ZoneScoped;
+    //      vCollision vc;
+    //      vc.t          = vfloat::splat(FLT_MAX);
+    //      vbool cur_hit = vray_triangle_test_moller(
+    //          vfloat3::splat(ro), vfloat3::splat(rd), tri.a, tri.b, tri.c,
+    //          vc);
+    //      if (cur_hit.none()) return col.t;
+    //      kto(16) {
+    //        if (!cur_hit.is_enabled(k)) continue;
+    //        Tri ntri = tri.extract(k);
+    //        if (vc.t[k] < col.t[i]) {
+    //          hit.enable(i);
+    //          /*col         = vc.extract(i);
+    //          col.mesh_id = k;
+    //          col.face_id = ntri.id;*/
+    //        }
+    //      }
+    //      return col.t;
+    //    });
+    //  }
+    //}
+
     kto(model.meshes.size) {
       ZoneScoped;
       BVH &bvh = bvhs[k];
-      bvh.vtraverse(ro, rd, [&](Tri *tris, u32 num_tris) {
+      mask().set(vmsk);
+      bvh.vtraverse(vro, vrd, [&](vTri const &tri) {
         ZoneScoped;
         vCollision c;
-        vbool      vmsk = cur_vmask();
-        mask().push();
-        defer(mask().pop());
-        ito(vfloat3::WIDTH) {
-          if (((u16)vmsk & (1 << i)) == 0) continue;
-          for (u32 tri_id = 0; tri_id < num_tris; tri_id += vfloat3::WIDTH) {
-            mask().enable_all();
-            vbool tri_test_mask = mask().cur();
-            if (num_tris - tri_id < vfloat3::WIDTH)
-              tri_test_mask = tri_test_mask & ~((1 << num_tris - tri_id) - 1);
-            mask().set(tri_test_mask);
-            if (mask().cur().none())
-              continue;
-            /*if (vray_triangle_test_moller(vfloat3::splat(ro.extract(i)),
-                                          vfloat3::splat(rd.extract(i)), tri.a,
-                                          tri.b, tri.c, c)) {
-              if (c.t < col.t) {
-                hit         = true;
-                col         = c;
-                col.mesh_id = k;
-                col.face_id = tri.id;
-              }
-            }*/
-          }
+        c.t        = vfloat::splat(FLT_MAX);
+        vbool vmsk = cur_vmask();
+        ito(16) {
+          if (!vmsk.is_enabled(i)) continue;
+          float3 ro = vro.extract(i);
+          float3 rd = vrd.extract(i);
+          mask().enable_all();
+          vbool cur_hit = vray_triangle_test_moller(
+              vfloat3::splat(ro), vfloat3::splat(rd), tri.a, tri.b, tri.c, c);
+          mask().set(vmsk);
+          if (cur_hit.none()) continue;
+          hit.enable(i);
+          /*jto(16) {
+            if (!cur_hit.is_enabled(i)) continue;
+            if (c.t[j] < col.t[i]) {
+              hit.enable(i);
+              col.mesh_id[i] = c.mesh_id[j];
+              col.face_id[i] = c.face_id[j];
+            }
+          }*/
         }
       });
+      // hit = hit | cur_vmask();
     }
     return hit;
   }
@@ -1475,17 +1680,17 @@ struct RTScene {
   Camera                  cam;
   float2                  halton_cache[0x100];
   u32                     primary_rays_cnt = 0;
-  Spin_Lock               rt0_locks[0x100];
+  Spin_Lock               rt0_locks[0x400];
   u32                     num_cpus;
 
   void retire_rt0(u32 i, u32 j, float4 d) {
     Spin_Lock &lock =
-        rt0_locks[hash_of((u64)i ^ hash_of((u64)j)) % ARRAY_SIZE(rt0_locks)];
+        rt0_locks[(hash_of((u64)i) ^ hash_of((u64)j)) % ARRAY_SIZE(rt0_locks)];
     lock.lock();
     defer(lock.unlock());
     rt0[i * iResolution.x + j] += d;
   }
-  void trace_primary(u32 i, u32 j, float3 ro, float3 rd) {
+  void trace_primary(u32 batch, u32 i, u32 j, float3 ro, float3 rd) {
     Path_Tracing_Job job;
     job.color      = float3(1.0f, 1.0f, 1.0f);
     job.depth      = 0;
@@ -1496,7 +1701,7 @@ struct RTScene {
     job.ray_dir    = rd;
     job.ray_origin = ro;
     job.weight     = 1.0f;
-    queue.enqueue((u32)(hash_of(i) ^ hash_of(j)), job);
+    queue.enqueue(batch, job);
   }
 
   void push_primary_rays(u32 num) {
@@ -1514,7 +1719,8 @@ struct RTScene {
                       1.0f;
           Ray ray        = gen_ray(cam, uv);
           u8  intersects = 0;
-          trace_primary(i, j, ray.o, ray.d);
+          trace_primary((u32)(hash_of(i) ^ hash_of(j) ^ hash_of(k / 16)), i, j,
+                        ray.o, ray.d);
         }
       }
     }
@@ -1522,11 +1728,9 @@ struct RTScene {
   }
 
   void init() {
-    scene.init(
-        stref_s("models/human_bust_sculpt/scene.gltf"),
-        // scene.init(stref_s("models/rank_3_police_unit/scene.gltf"),
-        // scene.init(stref_s("models/tree_low-poly_3d_model/scene.gltf"),
-        stref_s("env/kloetzle_blei_2k.hdr"));
+    scene.init(stref_s("models/human_bust_sculpt/scene.gltf"),
+               // scene.init(stref_s("models/old_tree/scene.gltf"),
+               stref_s("env/kloetzle_blei_2k.hdr"));
     queue.init();
     rt0.init();
     rt0.resize(iResolution.x * iResolution.y);
@@ -1597,46 +1801,55 @@ struct RTScene {
           res->local_queue.reserve(RAY_BATCH_SIZE * MAX_SECONDARY);
           u32 rays_emited = 0;
           if (!queue.try_dequeue(batch_hash, jobs, &num_rays)) continue;
-          //mask().enable_all();
-          //for (u32 i = num_rays; i < RAY_BATCH_SIZE; i++) {
-          //  mask().disable(i);
-          //}
-
-          //vCollision vcol;
-          //vfloat3    ray_origins;
-          //vfloat3    ray_dirs;
-          //kto(16) {
-          //  ray_origins.x[k] = jobs[k].ray_origin.x;
-          //  ray_origins.y[k] = jobs[k].ray_origin.y;
-          //  ray_origins.z[k] = jobs[k].ray_origin.z;
-          //  ray_dirs.x[k]    = jobs[k].ray_dir.x;
-          //  ray_dirs.y[k]    = jobs[k].ray_dir.y;
-          //  ray_dirs.z[k]    = jobs[k].ray_dir.z;
-          //}
-          //vbool collide = scene.vcollide(ray_origins, ray_dirs, vcol);
-
+          mask().enable_all();
 #if 1
+          for (u32 i = num_rays; i < RAY_BATCH_SIZE; i++) {
+            mask().disable(i);
+          }
+          vCollision vcol;
+          vfloat3    ray_origins;
+          vfloat3    ray_dirs;
+          kto(num_rays) {
+            ray_origins.x[k] = jobs[k].ray_origin.x;
+            ray_origins.y[k] = jobs[k].ray_origin.y;
+            ray_origins.z[k] = jobs[k].ray_origin.z;
+            ray_dirs.x[k]    = jobs[k].ray_dir.x;
+            ray_dirs.y[k]    = jobs[k].ray_dir.y;
+            ray_dirs.z[k]    = jobs[k].ray_dir.z;
+          }
+          vbool collide = scene.vcollide(ray_origins, ray_dirs, vcol);
+          kto(num_rays) {
+            Path_Tracing_Job job = jobs[k];
+            if (collide.is_enabled(k)) {
+              retire_rt0(job.pixel_y, job.pixel_x,
+                         float4(1.0f, 0.0f, 0.0f, 1.0f));
+            } else {
+              retire_rt0(job.pixel_y, job.pixel_x,
+                         float4(0.0f, 0.0f, 0.0f, 1.0f));
+            }
+          }
+#else
           kto(num_rays) {
             Path_Tracing_Job job = jobs[k];
             rays_traced++;
             Collision col;
             bool      collide = scene.collide(job.ray_origin, job.ray_dir, col);
             if (collide) {
-              retire_rt0(job.pixel_y, job.pixel_x, float4(1.0f, 0.0f, 0.0f, 1.0f));
-              //if (job.depth == 2) {
+              retire_rt0(job.pixel_y, job.pixel_x,
+                         float4(1.0f, 0.0f, 0.0f, 1.0f));
+              // if (job.depth == 2) {
               //  retire_rt0(job.pixel_y, job.pixel_x,
               //             float4(0.0f, 0.0f, 0.0f, job.weight));
               //  goto next_job;
               //} // if (job.depth == 2)
-              //PBR_Model &   model = scene.model;
-              //PBR_Material &mat   = model.materials[col.mesh_id];
-              //const u32     N     = MAX_SECONDARY >> job.depth;
-              //ito(N) {
-              //  float3           rn = res->rfs.sample_lambert_BRDF(col.normal);
-              //  Path_Tracing_Job new_job;
-              //  MEMZERO(new_job);
-              //  new_job.color      = float3(1.0f, 1.0f, 1.0f);
-              //  new_job.depth      = job.depth + 1;
+              // PBR_Model &   model = scene.model;
+              // PBR_Material &mat   = model.materials[col.mesh_id];
+              // const u32     N     = MAX_SECONDARY >> job.depth;
+              // ito(N) {
+              //  float3           rn =
+              //  res->rfs.sample_lambert_BRDF(col.normal); Path_Tracing_Job
+              //  new_job; MEMZERO(new_job); new_job.color      =
+              //  float3(1.0f, 1.0f, 1.0f); new_job.depth      = job.depth + 1;
               //  new_job._depth     = 0;
               //  new_job.light_id   = 0;
               //  new_job.pixel_x    = job.pixel_x;
@@ -1652,14 +1865,14 @@ struct RTScene {
               retire_rt0(job.pixel_y, job.pixel_x,
                          float4(0.0f, 0.0f, 0.0f, 1.0f));
               rays_misses++;
-             /* if (job.depth == 0) {
-                retire_rt0(job.pixel_y, job.pixel_x,
-                           float4(0.0f, 0.0f, 0.0f, job.weight));
-              } else {
-                float4 env = scene.env_value(job.ray_dir, job.color);
-                env.w      = 1.0f;
-                retire_rt0(job.pixel_y, job.pixel_x, job.weight * env);
-              }*/
+              /* if (job.depth == 0) {
+                 retire_rt0(job.pixel_y, job.pixel_x,
+                            float4(0.0f, 0.0f, 0.0f, job.weight));
+               } else {
+                 float4 env = scene.env_value(job.ray_dir, job.color);
+                 env.w      = 1.0f;
+                 retire_rt0(job.pixel_y, job.pixel_x, job.weight * env);
+               }*/
             } // else (collide)
 
             if (res->local_queue.size != 0)
@@ -1731,7 +1944,7 @@ int main(int argc, char *argv[]) {
 
   RTScene rts;
   rts.init();
-  rts.push_primary_rays(32);
+  rts.push_primary_rays(64);
   rts.trace();
   rts.write_ppm();
   defer({ rts.release(); });
